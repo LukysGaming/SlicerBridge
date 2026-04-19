@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 SlicerBridge — Universal 3D printing slicer protocol bridge
-https://github.com/YOUR_USERNAME/SlicerBridge
+https://github.com/LukysGaming/SlicerBridge
 
 Build:  pyinstaller --onefile --noconsole main.py
 
