@@ -110,4 +110,4 @@ For the best experience on MakerWorld and Printables, install the companion Tamp
 
 ## License
 
-MIT
+MPL 2.0
