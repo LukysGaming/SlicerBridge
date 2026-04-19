@@ -11,7 +11,8 @@ if errorlevel 1 (
 )
 
 echo Building...
-python -m PyInstaller --onefile --noconsole --name SlicerBridge main.py
+:: Přidán parametr --icon
+python -m PyInstaller --onefile --noconsole --icon=icon.ico --name SlicerBridge main.py
 
 echo.
 if exist "%~dp0dist\SlicerBridge.exe" (
