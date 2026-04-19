@@ -12,13 +12,15 @@ Modes:
 """
 
 import sys, os, json, shutil, subprocess, tempfile, traceback
-import urllib.parse, urllib.request
+import urllib.parse, urllib.request, urllib.error
+import http.cookiejar
 import ctypes, winreg
 
 # ═══════════════════════════════════════════════════════════════════════
 #  CONSTANTS
 # ═══════════════════════════════════════════════════════════════════════
 
+VERSION          = "1.0"
 APP_NAME         = "SlicerBridge"
 INSTALL_DIR_DEF  = r"C:\Program Files (x86)\SlicerBridge"
 EXE_NAME         = "SlicerBridge.exe"
@@ -157,27 +159,101 @@ def is_admin() -> bool:
 
 def needs_install() -> bool:
     """
-    True if the exe is running from a temporary / download location
-    and has not been installed to a permanent path yet.
+    True when the user should be prompted to choose an install location.
+
+    Triggers if:
+      - The exe is running from a temporary / download-like folder, OR
+      - There is no config yet at all (genuine first run from any location)
+    Suppressed if the config already records a valid installed exe path.
     """
-    exe = sys.executable.lower()
-    suspicious = ["downloads", "desktop", "\\temp\\", "\\tmp\\",
-                  "/downloads/", "/desktop/", "/temp/", "/tmp/"]
-    already_installed = load_config().get("installed_exe", "")
+    cfg = load_config()
+    already_installed = cfg.get("installed_exe", "")
     if already_installed and os.path.isfile(already_installed):
-        return False
+        return False                          # already set up -> skip
+
+    # First-ever run (no config file) -> always ask where to install
+    if not os.path.isfile(CONFIG_FILE):
+        return True
+
+    # Running from a temporary / staging folder
+    exe = sys.executable.lower()
+    suspicious = [
+        "downloads", "desktop",
+        "\\temp\\", "\\tmp\\",
+        "/downloads/", "/desktop/", "/temp/", "/tmp/",
+    ]
     return any(s in exe for s in suspicious)
 
-def copy_to_install_dir(dest_dir: str) -> str:
+def get_build_date() -> str:
+    """Returns the .exe modification time as a human-readable build date."""
+    try:
+        from datetime import datetime
+        return datetime.fromtimestamp(os.path.getmtime(sys.executable)).strftime("%Y-%m-%d  %H:%M")
+    except Exception:
+        return "unknown"
+
+def _schedule_delete(path: str):
+    """Spawns a detached .bat that retries until the source exe is deleted."""
+    bat = os.path.join(tempfile.gettempdir(), "slicerbridge_cleanup.bat")
+    with open(bat, "w") as f:
+        f.write(
+            "@echo off\n"
+            ":loop\n"
+            f'del /f /q "{path}" 2>nul\n'
+            f'if exist "{path}" (timeout /t 1 >nul && goto loop)\n'
+            'del /f /q "%~f0"\n'
+        )
+    si = subprocess.STARTUPINFO()
+    si.dwFlags  |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0   # SW_HIDE
+    subprocess.Popen(
+        ["cmd.exe", "/c", bat],
+        startupinfo=si,
+        creationflags=subprocess.DETACHED_PROCESS,
+    )
+
+def move_to_install_dir(dest_dir: str) -> str:
     """
-    Copies this exe to dest_dir\SlicerBridge.exe.
+    Copies this exe to dest_dir\SlicerBridge.exe, then removes the original.
+    Schedules a background cleanup if the OS refuses immediate deletion.
     Returns the full path of the installed exe.
     """
     os.makedirs(dest_dir, exist_ok=True)
     dest = os.path.join(dest_dir, EXE_NAME)
-    if os.path.abspath(sys.executable).lower() != dest.lower():
-        shutil.copy2(sys.executable, dest)
+    src  = os.path.abspath(sys.executable)
+    if src.lower() != dest.lower():
+        shutil.copy2(src, dest)
+        try:
+            os.remove(src)
+        except OSError:
+            _schedule_delete(src)
     return dest
+
+copy_to_install_dir = move_to_install_dir
+
+def is_registered() -> bool:
+    """Returns True if at least one SlicerBridge protocol is in the registry."""
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, list(PROTOCOLS.keys())[0])
+        winreg.CloseKey(key)
+        return True
+    except FileNotFoundError:
+        return False
+
+def remove_registry():
+    """Removes all SlicerBridge protocol registrations from the registry. Requires admin."""
+    for proto in PROTOCOLS:
+        for subkey in [
+            rf"{proto}\shell\open\command",
+            rf"{proto}\shell\open",
+            rf"{proto}\shell",
+            proto,
+        ]:
+            try:
+                winreg.DeleteKey(winreg.HKEY_CLASSES_ROOT, subkey)
+            except FileNotFoundError:
+                pass
+    log(f"Registry removed — {len(PROTOCOLS)} protocols unregistered.")
 
 # ═══════════════════════════════════════════════════════════════════════
 #  REGISTRY
@@ -224,7 +300,8 @@ def extract_url(uri: str):
     return None
 
 def handle_protocol(uri: str):
-    log(f"\n{'─'*50}")
+    log(f"\n--- NOVY KLIK ---")
+    log(f"argv: {sys.argv}")
     log(f"URI: {uri}")
 
     cfg    = load_config()
@@ -245,37 +322,62 @@ def handle_protocol(uri: str):
 
         log(f"URL: {url}")
 
-        ext = os.path.splitext(urllib.parse.urlparse(url).path)[1].lower()
+        parsed_url = urllib.parse.urlparse(url)
+        ext = os.path.splitext(parsed_url.path)[1].lower()
         if ext not in VALID_EXT:
-            log(f"Unknown extension '{ext}' -> using .3mf")
+            log(f"Neznámá přípona '{ext}', defaultuji na .3mf")
             ext = ".3mf"
 
         target = os.path.join(tempfile.gettempdir(), f"slicerbridge{ext}")
-        log(f"Downloading -> {target}")
+        log(f"Stahuji do: {target}")
 
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": (
+        # Build a Referer from the download URL's origin so sites like
+        # Thingiverse don't return 403 Forbidden.
+        origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
+        referer = origin + "/"
+
+        headers = {
+            "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
-            )}
+            ),
+            "Referer":        referer,
+            "Origin":         origin,
+            "Accept":         "application/octet-stream,*/*;q=0.9",
+            "Accept-Language":"en-US,en;q=0.9",
+            "Accept-Encoding":"gzip, deflate, br",
+            "Connection":     "keep-alive",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
+            "Upgrade-Insecure-Requests": "1",
+        }
+
+        # Some sites (Thingiverse) redirect through auth — follow up to 5 hops.
+        cookie_jar = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(cookie_jar),
+            urllib.request.HTTPRedirectHandler(),
         )
-        with urllib.request.urlopen(req, timeout=30) as r, \
+        req = urllib.request.Request(url, headers=headers)
+        with opener.open(req, timeout=30) as r, \
              open(target, "wb") as f:
             f.write(r.read())
 
-        log("Downloaded OK. Launching slicer...")
+        log("Staženo OK. Spouštím slicer...")
         subprocess.Popen(
             [slicer, target],
             creationflags=subprocess.CREATE_NO_WINDOW
         )
-        log("Slicer launched OK")
+        log("Slicer spuštěn OK")
 
+    except urllib.error.HTTPError as e:
+        log(f"CHYBA stahování: {e}\n{traceback.format_exc()}")
     except urllib.error.URLError as e:
-        log(f"Download error: {e}\n{traceback.format_exc()}")
+        log(f"CHYBA sítě: {e}\n{traceback.format_exc()}")
     except Exception as e:
-        log(f"Error: {e}\n{traceback.format_exc()}")
+        log(f"CHYBA: {e}\n{traceback.format_exc()}")
 
 # ═══════════════════════════════════════════════════════════════════════
 #  GUI
@@ -307,11 +409,48 @@ def show_gui(error: str = ""):
     found   = scan_slicers()
     offer_install = needs_install()
 
+    TITLEBAR_H = 32
+    WIN_H = (660 if offer_install else 580) + TITLEBAR_H
+
     root = tk.Tk()
-    root.title("SlicerBridge")
-    root.geometry("700x660" if offer_install else "700x580")
-    root.resizable(False, False)
+    root.overrideredirect(True)          # remove native titlebar
+    root.geometry(f"700x{WIN_H}")
     root.configure(bg=BG)
+
+    # ── Custom titlebar ───────────────────────────────────────────────
+    tb = tk.Frame(root, bg=BORDER, height=TITLEBAR_H)
+    tb.pack(fill="x", side="top")
+    tb.pack_propagate(False)
+
+    tk.Label(tb, text="⬡  SlicerBridge", bg=BORDER, fg=FG,
+             font=("Segoe UI", 10, "bold")).pack(side="left", padx=12, pady=6)
+
+    def _close():  root.destroy()
+
+    def _minimize():
+        root.overrideredirect(False)
+        root.iconify()
+
+    def _on_map(e):
+        root.overrideredirect(True)
+
+    root.bind("<Map>", _on_map)
+
+    for txt, cmd, hover in [("✕", _close, RED_C), ("─", _minimize, GRAY)]:
+        b = tk.Label(tb, text=txt, bg=BORDER, fg=GRAY,
+                     font=("Segoe UI", 11), cursor="hand2", padx=12)
+        b.pack(side="right")
+        b.bind("<Button-1>", lambda e, c=cmd: c())
+        b.bind("<Enter>",    lambda e, w=b, h=hover: w.configure(fg=h, bg="#3a3b4d"))
+        b.bind("<Leave>",    lambda e, w=b: w.configure(fg=GRAY, bg=BORDER))
+
+    # Drag support
+    _drag = {}
+    def _drag_start(e): _drag["x"], _drag["y"] = e.x, e.y
+    def _drag_move(e):
+        root.geometry(f"+{root.winfo_x()+e.x-_drag['x']}+{root.winfo_y()+e.y-_drag['y']}")
+    tb.bind("<Button-1>",   _drag_start)
+    tb.bind("<B1-Motion>",  _drag_move)
 
     def sep():
         tk.Frame(root, bg=BORDER, height=1).pack(fill="x", padx=28, pady=10)
@@ -329,10 +468,11 @@ def show_gui(error: str = ""):
     install_dir_var = tk.StringVar()
 
     if offer_install:
-        tk.Label(root, text="Step 1 — Install location",
+        tk.Label(root, text="Step 1 — Choose install location",
                  bg=BG, fg=FG, font=FONT_LG).pack(anchor="w", padx=28)
         tk.Label(root,
-                 text="SlicerBridge will copy itself here so it stays after you clean Downloads.",
+                 text="SlicerBridge will copy itself to this folder so it works permanently.\n"
+                      "Default is Program Files (x86) — you can change it below.",
                  bg=BG, fg=GRAY, font=FONT_SM).pack(anchor="w", padx=30, pady=(2, 8))
 
         # Suggest Program Files (x86) by default, or current installed location
@@ -362,6 +502,17 @@ def show_gui(error: str = ""):
             activebackground=ACCENT, activeforeground=BG,
             cursor="hand2", command=browse_install, padx=10
         ).pack(side="left")
+
+        # Move vs copy checkbox
+        move_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            root,
+            text="Move file to install location (removes it from Downloads)",
+            variable=move_var,
+            bg=BG, fg=FG, selectcolor=BG,
+            activebackground=BG, activeforeground=ACCENT,
+            font=FONT_SM, cursor="hand2",
+        ).pack(anchor="w", padx=28, pady=(4, 0))
 
         # Quick-pick shortcuts
         picks_frame = tk.Frame(root, bg=BG)
@@ -476,36 +627,38 @@ def show_gui(error: str = ""):
             status_lbl.configure(fg=RED_C)
             return
 
-        # Determine where the handler exe will live
+        # Determine where the handler exe will live.
+        # NOTE: we do NOT copy here — copying to Program Files needs admin,
+        # so the actual copy+registry write both happen inside --register
+        # (the UAC-elevated process).  We only need to know the destination.
         if offer_install:
             dest_dir = install_dir_var.get().strip()
             if not dest_dir:
                 status_var.set("⚠  Please enter an install directory.")
                 status_lbl.configure(fg=RED_C)
                 return
-            try:
-                handler_exe = copy_to_install_dir(dest_dir)
-            except Exception as e:
-                status_var.set(f"⚠  Could not copy to {dest_dir}: {e}")
-                status_lbl.configure(fg=RED_C)
-                return
+            handler_exe = os.path.join(dest_dir, EXE_NAME)
         else:
+            dest_dir    = ""
             handler_exe = sys.executable
 
-        # Save config, then write registry (needs UAC)
+        # Persist everything the elevated process will need
         save_config({
             "slicer_path":   chosen_slicer,
             "installed_exe": handler_exe,
             "handler_exe":   handler_exe,
+            "install_dir":   dest_dir,
+            "source_exe":    sys.executable,   # so --register knows what to move
         })
 
         if not is_admin():
             status_var.set("Requesting admin rights (UAC)…")
             status_lbl.configure(fg=YELLOW)
             root.update()
+            # Elevate from the CURRENT exe (still in Downloads / wherever)
             ctypes.windll.shell32.ShellExecuteW(
                 None, "runas",
-                handler_exe, "--register",
+                sys.executable, "--register",
                 None, 1
             )
             root.after(2000, root.destroy)
@@ -531,33 +684,86 @@ def show_gui(error: str = ""):
     btn_frame = tk.Frame(root, bg=BG)
     btn_frame.pack(pady=4)
 
-    def mkbtn(text, cmd, primary=False):
+    def mkbtn(parent, text, cmd, primary=False, danger=False):
+        c_bg = ACCENT if primary else (RED_C if danger else BORDER)
+        c_fg = BG    if primary else (BG     if danger else FG)
+        c_ho = GREEN if primary else (RED_C  if danger else GRAY)
         tk.Button(
-            btn_frame, text=text, command=cmd,
-            bg=ACCENT if primary else BORDER,
-            fg=BG if primary else FG,
+            parent, text=text, command=cmd,
+            bg=c_bg, fg=c_fg,
             font=("Segoe UI", 10, "bold") if primary else FONT,
             relief="flat", cursor="hand2", padx=16, pady=7,
-            activebackground=GREEN if primary else GRAY,
-            activeforeground=BG
+            activebackground=c_ho, activeforeground=BG
         ).pack(side="left", padx=5)
 
-    mkbtn("  ✓  Install  ", do_install, primary=True)
-    mkbtn("Open log",
+    mkbtn(btn_frame, "  ✓  Install  ", do_install, primary=True)
+    mkbtn(btn_frame, "Open log",
           lambda: os.startfile(LOG_FILE) if os.path.isfile(LOG_FILE)
           else status_var.set("No log yet."))
-    mkbtn("Config folder",
+    mkbtn(btn_frame, "Config folder",
           lambda: (os.makedirs(CONFIG_DIR, exist_ok=True),
                    os.startfile(CONFIG_DIR)))
 
+    # ── Uninstall (only shown when registry entries actually exist) ──────
+    if is_registered():
+        sep()
+        uninstall_frame = tk.Frame(root, bg=BG)
+        uninstall_frame.pack(anchor="w", padx=28, pady=(0, 4))
+        tk.Label(uninstall_frame, text="Danger zone",
+                 bg=BG, fg=GRAY, font=FONT_SM).pack(side="left", padx=(0, 12))
+
+        def do_uninstall():
+            from tkinter import messagebox
+            if not messagebox.askyesno(
+                "Uninstall SlicerBridge",
+                "This will remove all registry entries.\n\n"
+                "Your slicer and downloaded models are NOT affected.\n\n"
+                "Continue?",
+                icon="warning"
+            ):
+                return
+            if not is_admin():
+                status_var.set("Requesting admin rights (UAC)…")
+                status_lbl.configure(fg=YELLOW)
+                root.update()
+                ctypes.windll.shell32.ShellExecuteW(
+                    None, "runas",
+                    sys.executable, "--uninstall",
+                    None, 1
+                )
+                root.after(2000, root.destroy)
+                return
+            try:
+                remove_registry()
+                # Delete config entirely so next launch shows Step 1
+                try:
+                    os.remove(CONFIG_FILE)
+                except FileNotFoundError:
+                    pass
+                status_lbl.configure(fg=GREEN)
+                status_var.set("✓  Uninstalled. You can delete SlicerBridge.exe manually.")
+            except Exception as e:
+                status_lbl.configure(fg=RED_C)
+                status_var.set(f"✗  {e}")
+
+        mkbtn(uninstall_frame, "  ✗  Uninstall  ", do_uninstall, danger=True)
+
     # ── Footer ────────────────────────────────────────────────────────
     tk.Frame(root, bg=BORDER, height=1).pack(fill="x", padx=28, pady=(12, 4))
-    tk.Label(
-        root,
-        text=f"Keep SlicerBridge.exe in the install location — "
-             f"the registry points directly to it.",
-        bg=BG, fg=FG_DIM, font=FONT_SM
-    ).pack(anchor="w", padx=28, pady=(0, 14))
+    footer_frame = tk.Frame(root, bg=BG)
+    footer_frame.pack(fill="x", padx=28, pady=(0, 14))
+
+    tk.Label(footer_frame,
+             text=f"v{VERSION}  ·  built {get_build_date()}",
+             bg=BG, fg=FG_DIM, font=FONT_SM).pack(side="left")
+
+    gh_lbl = tk.Label(footer_frame, text="GitHub ↗",
+                      bg=BG, fg=ACCENT, font=FONT_SM, cursor="hand2")
+    gh_lbl.pack(side="right")
+    gh_lbl.bind("<Button-1>", lambda e: __import__("webbrowser").open(
+        "https://github.com/LukysGaming/SlicerBridge"))
+    gh_lbl.bind("<Enter>", lambda e: gh_lbl.configure(fg=FG))
+    gh_lbl.bind("<Leave>", lambda e: gh_lbl.configure(fg=ACCENT))
 
     root.mainloop()
 
@@ -572,30 +778,78 @@ if __name__ == "__main__":
     args = sys.argv[1:]
 
     if args and args[0] == "--register":
-        # Called automatically by the GUI after UAC elevation
+        # Called automatically by the GUI after UAC elevation.
+        # This process has admin rights, so it can:
+        #   1. Create the install directory and copy/move the exe there
+        #   2. Write the registry
         if not is_admin():
             sys.exit(1)
-        cfg = load_config()
-        exe = cfg.get("handler_exe", sys.executable)
+        import tkinter as tk
+        from tkinter import messagebox
+        cfg        = load_config()
+        dest_dir   = cfg.get("install_dir", "")
+        source_exe = cfg.get("source_exe", sys.executable)
+        slicer     = cfg.get("slicer_path", "???")
         try:
-            write_registry(exe)
-            import tkinter as tk
-            from tkinter import messagebox
+            # Step 1 — move exe to its permanent home (if a dest_dir was chosen)
+            if dest_dir:
+                handler_exe = move_to_install_dir(dest_dir)
+                # Update config so future launches use the new path
+                cfg["installed_exe"] = handler_exe
+                cfg["handler_exe"]   = handler_exe
+                save_config(cfg)
+            else:
+                handler_exe = sys.executable
+
+            # Step 2 — write registry pointing to the new location
+            write_registry(handler_exe)
+
             r = tk.Tk(); r.withdraw()
             messagebox.showinfo(
-                "SlicerBridge",
+                "SlicerBridge — Installed",
                 f"Installation complete!\n\n"
                 f"{len(PROTOCOLS)} protocols registered.\n\n"
-                f"Handler:  {exe}\n"
-                f"Slicer:   {cfg.get('slicer_path', '???')}"
+                f"Handler:  {handler_exe}\n"
+                f"Slicer:   {slicer}"
             )
             r.destroy()
         except Exception as e:
-            import tkinter as tk
-            from tkinter import messagebox
             r = tk.Tk(); r.withdraw()
             messagebox.showerror("SlicerBridge — Error", str(e))
             r.destroy()
+        sys.exit(0)
+
+    elif args and args[0] == "--uninstall":
+        # Called by the GUI Uninstall button after UAC elevation
+        if not is_admin():
+            sys.exit(1)
+        import tkinter as tk
+        from tkinter import messagebox
+        r = tk.Tk(); r.withdraw()
+        try:
+            remove_registry()
+            try:
+                os.remove(CONFIG_FILE)
+            except FileNotFoundError:
+                pass
+            messagebox.showinfo(
+                "SlicerBridge — Uninstalled",
+                f"All {len(PROTOCOLS)} protocol registrations removed.\n\n"
+                "You can now delete SlicerBridge.exe from its install folder."
+            )
+        except Exception as e:
+            messagebox.showerror("SlicerBridge — Error", str(e))
+        r.destroy()
+        sys.exit(0)
+
+    elif args and args[0] == "--reset":
+        # Developer helper: wipe config so the next launch shows Step 1 again.
+        # Usage: SlicerBridge.exe --reset
+        try:
+            os.remove(CONFIG_FILE)
+            print(f"Config deleted: {CONFIG_FILE}")
+        except FileNotFoundError:
+            print("No config found — already clean.")
         sys.exit(0)
 
     elif args and _is_protocol_uri(args[0]):
