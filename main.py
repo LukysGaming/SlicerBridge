@@ -3,33 +3,69 @@
 SlicerBridge — Universal 3D printing slicer protocol bridge
 https://github.com/LukysGaming/SlicerBridge
 
-Build:  pyinstaller --onefile --noconsole main.py
+Build:  pyinstaller --onedir --noconsole --name SlicerBridge main.py
 
 Modes:
   SlicerBridge.exe                 → GUI installer / configurator
   SlicerBridge.exe <protocol://…>  → silent handler (download + open slicer)
-  SlicerBridge.exe --register      → write registry (called automatically via UAC)
+  SlicerBridge.exe --register      → copy exe + write registry (via UAC elevation)
+  SlicerBridge.exe --uninstall     → remove registry + files  (via UAC elevation)
+  SlicerBridge.exe --reset         → delete config (developer helper)
 """
 
-import sys, os, json, shutil, subprocess, tempfile, traceback
-import urllib.parse, urllib.request, urllib.error
+from __future__ import annotations
+
+import ctypes
 import http.cookiejar
-import ctypes, winreg
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import traceback
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+import winreg
+from datetime import datetime
+from typing import Optional
 
-# ═══════════════════════════════════════════════════════════════════════
-#  CONSTANTS
-# ═══════════════════════════════════════════════════════════════════════
 
-VERSION          = "1.0"
-APP_NAME         = "SlicerBridge"
-INSTALL_DIR_DEF  = r"C:\Program Files (x86)\SlicerBridge"
-EXE_NAME         = "SlicerBridge.exe"
-CONFIG_DIR       = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME)
-CONFIG_FILE      = os.path.join(CONFIG_DIR, "config.json")
-LOG_FILE         = os.path.join(CONFIG_DIR, "log.txt")
+# ── Hide the console window as the very first thing ──────────────────────────
+# PyInstaller's onedir bootloader can briefly flash a console before --noconsole
+# takes effect. Hiding it here suppresses that flash.
 
-# Protocols to intercept → redirect to user's chosen slicer
-PROTOCOLS = {
+def _hide_console() -> None:
+    try:
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE = 0
+    except Exception:
+        pass
+
+_hide_console()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONSTANTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+VERSION         = "1.1"
+APP_NAME        = "SlicerBridge"
+EXE_NAME        = "SlicerBridge.exe"
+INSTALL_DIR_DEF = r"C:\Program Files (x86)\SlicerBridge"
+TEMP_PREFIX     = "slicerbridge_"
+TEMP_MAX_AGE_S  = 86_400  # clean up temp files older than 24 h
+
+CONFIG_DIR  = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME)
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+LOG_FILE    = os.path.join(CONFIG_DIR, "log.txt")
+
+# Protocols intercepted → redirected to the user's chosen slicer
+PROTOCOLS: dict[str, str] = {
     "bambustudio":  "BambuStudio  (MakerWorld)",
     "orcaslicer":   "OrcaSlicer   (MakerWorld, Printables)",
     "prusaslicer":  "PrusaSlicer  (Printables)",
@@ -40,10 +76,11 @@ PROTOCOLS = {
     "flashprint":   "FlashPrint   (FlashForge)",
     "thingiverse":  "Thingiverse  (direct)",
     "creality":     "Creality     (Creality Cloud)",
+    "slicerbridge": "SlicerBridge (multi-file, Tampermonkey)",
 }
 
-# Slicer definitions — first path that exists on disk wins
-SLICERS = [
+# Slicer auto-detection — first existing path in each list wins
+SLICERS: list[dict] = [
     {
         "name": "Creality Print",
         "paths": [
@@ -117,39 +154,58 @@ SLICERS = [
     },
 ]
 
-VALID_EXT = {".3mf", ".stl", ".obj", ".amf", ".step", ".stp",
-             ".gcode", ".ctb", ".cbddlp", ".photon"}
+VALID_EXTENSIONS = {
+    ".3mf", ".stl", ".obj", ".amf", ".step", ".stp",
+    ".gcode", ".ctb", ".cbddlp", ".photon",
+}
 
-# ═══════════════════════════════════════════════════════════════════════
-#  UTILITIES
-# ═══════════════════════════════════════════════════════════════════════
+# HTTP headers sent with every download request
+_DOWNLOAD_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept":          "application/octet-stream,*/*;q=0.9",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection":      "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
 
-def log(msg: str):
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LOGGING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def log(msg: str) -> None:
     os.makedirs(CONFIG_DIR, exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(msg + "\n")
+        f.write(f"[{ts}] {msg}\n")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def load_config() -> dict:
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
-def save_config(data: dict):
+
+def save_config(data: dict) -> None:
     os.makedirs(CONFIG_DIR, exist_ok=True)
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-def scan_slicers() -> list:
-    """Returns [(slicer_def, found_path), ...]"""
-    found = []
-    for s in SLICERS:
-        for p in s["paths"]:
-            if os.path.isfile(p):
-                found.append((s, p))
-                break
-    return found
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SYSTEM UTILITIES
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def is_admin() -> bool:
     try:
@@ -157,91 +213,135 @@ def is_admin() -> bool:
     except Exception:
         return False
 
-def needs_install() -> bool:
-    """
-    True when the user should be prompted to choose an install location.
-
-    Triggers if:
-      - The exe is running from a temporary / download-like folder, OR
-      - There is no config yet at all (genuine first run from any location)
-    Suppressed if the config already records a valid installed exe path.
-    """
-    cfg = load_config()
-    already_installed = cfg.get("installed_exe", "")
-    if already_installed and os.path.isfile(already_installed):
-        return False                          # already set up -> skip
-
-    # First-ever run (no config file) -> always ask where to install
-    if not os.path.isfile(CONFIG_FILE):
-        return True
-
-    # Running from a temporary / staging folder
-    exe = sys.executable.lower()
-    suspicious = [
-        "downloads", "desktop",
-        "\\temp\\", "\\tmp\\",
-        "/downloads/", "/desktop/", "/temp/", "/tmp/",
-    ]
-    return any(s in exe for s in suspicious)
 
 def get_build_date() -> str:
-    """Returns the .exe modification time as a human-readable build date."""
     try:
-        from datetime import datetime
         return datetime.fromtimestamp(os.path.getmtime(sys.executable)).strftime("%Y-%m-%d  %H:%M")
     except Exception:
         return "unknown"
 
-def _schedule_delete(path: str):
-    """Spawns a detached .bat that retries until the source exe is deleted."""
-    bat = os.path.join(tempfile.gettempdir(), "slicerbridge_cleanup.bat")
-    with open(bat, "w") as f:
-        f.write(
-            "@echo off\n"
-            ":loop\n"
-            f'del /f /q "{path}" 2>nul\n'
-            f'if exist "{path}" (timeout /t 1 >nul && goto loop)\n'
-            'del /f /q "%~f0"\n'
-        )
-    si = subprocess.STARTUPINFO()
-    si.dwFlags  |= subprocess.STARTF_USESHOWWINDOW
-    si.wShowWindow = 0   # SW_HIDE
-    subprocess.Popen(
-        ["cmd.exe", "/c", bat],
-        startupinfo=si,
-        creationflags=subprocess.DETACHED_PROCESS,
-    )
 
-def move_to_install_dir(dest_dir: str) -> str:
+def scan_slicers() -> list[tuple[dict, str]]:
+    """Returns [(slicer_def, found_path), ...] for every detected slicer."""
+    found = []
+    for slicer in SLICERS:
+        for path in slicer["paths"]:
+            if os.path.isfile(path):
+                found.append((slicer, path))
+                break
+    return found
+
+
+def needs_install() -> bool:
     """
-    Copies this exe to dest_dir\SlicerBridge.exe, then removes the original.
-    Schedules a background cleanup if the OS refuses immediate deletion.
-    Returns the full path of the installed exe.
+    Returns True when the user should be prompted for an install location.
+
+    Skipped when config already records a valid installed exe path.
+    Triggered on first run, or when the exe is running from a temp/download folder.
+    """
+    cfg = load_config()
+    installed = cfg.get("installed_exe", "")
+    if installed and os.path.isfile(installed):
+        return False  # Already set up
+
+    if not os.path.isfile(CONFIG_FILE):
+        return True   # First-ever run
+
+    # Running from a staging / download-like folder
+    exe = sys.executable.lower()
+    staging_indicators = [
+        "downloads", "desktop",
+        "\\temp\\", "\\tmp\\", "/temp/", "/tmp/",
+    ]
+    return any(s in exe for s in staging_indicators)
+
+
+
+def move_to_install_dir(dest_dir: str, remove_source: bool = True) -> str:
+    """
+    Copies (or moves) SlicerBridge into dest_dir.
+
+    Handles both PyInstaller layouts:
+      - onedir : copies the entire directory (exe + _internal DLLs/pyds)
+      - onefile: copies just the exe
+
+    Returns the full path of the installed SlicerBridge.exe.
     """
     os.makedirs(dest_dir, exist_ok=True)
-    dest = os.path.join(dest_dir, EXE_NAME)
-    src  = os.path.abspath(sys.executable)
-    if src.lower() != dest.lower():
-        shutil.copy2(src, dest)
-        try:
-            os.remove(src)
-        except OSError:
-            _schedule_delete(src)
-    return dest
+    src_exe  = os.path.abspath(sys.executable)
+    src_dir  = os.path.dirname(src_exe)
+    dest_exe = os.path.join(dest_dir, EXE_NAME)
 
-copy_to_install_dir = move_to_install_dir
+    is_onedir = any(f.endswith((".dll", ".pyd", ".so")) for f in os.listdir(src_dir))
 
-def is_registered() -> bool:
-    """Returns True if at least one SlicerBridge protocol is in the registry."""
+    if is_onedir:
+        if os.path.normcase(src_dir) != os.path.normcase(dest_dir):
+            if os.path.isdir(dest_dir):
+                shutil.rmtree(dest_dir, ignore_errors=True)
+            shutil.copytree(src_dir, dest_dir)
+            if remove_source:
+                shutil.rmtree(src_dir, ignore_errors=True)
+    else:
+        if os.path.normcase(src_exe) != os.path.normcase(dest_exe):
+            shutil.copy2(src_exe, dest_exe)
+            if remove_source:
+                try:
+                    os.remove(src_exe)
+                except OSError:
+                    pass
+
+    return dest_exe
+
+
+def cleanup_old_temp_files() -> None:
+    """Removes SlicerBridge temp files/dirs older than TEMP_MAX_AGE_S seconds."""
+    tmp     = tempfile.gettempdir()
+    cutoff  = time.time() - TEMP_MAX_AGE_S
     try:
-        key = winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, list(PROTOCOLS.keys())[0])
-        winreg.CloseKey(key)
-        return True
-    except FileNotFoundError:
-        return False
+        for name in os.listdir(tmp):
+            if not name.startswith(TEMP_PREFIX):
+                continue
+            path = os.path.join(tmp, name)
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    if os.path.isdir(path):
+                        shutil.rmtree(path, ignore_errors=True)
+                    else:
+                        os.remove(path)
+            except OSError:
+                pass
+    except OSError:
+        pass
 
-def remove_registry():
-    """Removes all SlicerBridge protocol registrations from the registry. Requires admin."""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# REGISTRY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def write_registry(exe_path: str) -> None:
+    """Registers all protocols in HKEY_CLASSES_ROOT. Requires admin."""
+    for proto, label in PROTOCOLS.items():
+        root_key = winreg.CreateKeyEx(
+            winreg.HKEY_CLASSES_ROOT, proto, 0,
+            winreg.KEY_WRITE | winreg.KEY_CREATE_SUB_KEY,
+        )
+        winreg.SetValueEx(root_key, "",             0, winreg.REG_SZ, f"URL:{label}")
+        winreg.SetValueEx(root_key, "URL Protocol", 0, winreg.REG_SZ, "")
+        winreg.CloseKey(root_key)
+
+        cmd_key = winreg.CreateKeyEx(
+            winreg.HKEY_CLASSES_ROOT,
+            rf"{proto}\shell\open\command", 0,
+            winreg.KEY_WRITE | winreg.KEY_CREATE_SUB_KEY,
+        )
+        winreg.SetValueEx(cmd_key, "", 0, winreg.REG_SZ, f'"{exe_path}" "%1"')
+        winreg.CloseKey(cmd_key)
+
+    log(f"Registry written — {len(PROTOCOLS)} protocols → {exe_path}")
+
+
+def remove_registry() -> None:
+    """Removes all SlicerBridge protocol registrations. Requires admin."""
     for proto in PROTOCOLS:
         for subkey in [
             rf"{proto}\shell\open\command",
@@ -253,147 +353,218 @@ def remove_registry():
                 winreg.DeleteKey(winreg.HKEY_CLASSES_ROOT, subkey)
             except FileNotFoundError:
                 pass
-    log(f"Registry removed — {len(PROTOCOLS)} protocols unregistered.")
+    log(f"Registry cleared — {len(PROTOCOLS)} protocols removed.")
 
-# ═══════════════════════════════════════════════════════════════════════
-#  REGISTRY
-# ═══════════════════════════════════════════════════════════════════════
 
-def write_registry(exe_path: str):
-    """Registers all protocols in HKEY_CLASSES_ROOT. Requires admin."""
-    for proto, label in PROTOCOLS.items():
-        key = winreg.CreateKeyEx(
-            winreg.HKEY_CLASSES_ROOT, proto, 0,
-            winreg.KEY_WRITE | winreg.KEY_CREATE_SUB_KEY
-        )
-        winreg.SetValueEx(key, "",             0, winreg.REG_SZ, f"URL:{label}")
-        winreg.SetValueEx(key, "URL Protocol", 0, winreg.REG_SZ, "")
-        winreg.CloseKey(key)
-
-        cmd_key = winreg.CreateKeyEx(
-            winreg.HKEY_CLASSES_ROOT,
-            rf"{proto}\shell\open\command", 0,
-            winreg.KEY_WRITE | winreg.KEY_CREATE_SUB_KEY
-        )
-        winreg.SetValueEx(cmd_key, "", 0, winreg.REG_SZ, f'"{exe_path}" "%1"')
-        winreg.CloseKey(cmd_key)
-
-    log(f"Registry OK — {len(PROTOCOLS)} protocols -> {exe_path}")
-
-# ═══════════════════════════════════════════════════════════════════════
-#  PROTOCOL HANDLER
-# ═══════════════════════════════════════════════════════════════════════
-
-def extract_url(uri: str):
+def is_registered() -> bool:
+    """Returns True if SlicerBridge has registered at least one protocol."""
+    # Our own protocol is guaranteed to be ours if present
     try:
-        parsed = urllib.parse.urlparse(uri)
-        params = urllib.parse.parse_qs(parsed.query)
-        for name in ("file", "model", "url", "download_url", "files"):
-            if name in params:
-                return urllib.parse.unquote(params[name][0])
+        key = winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r"slicerbridge\shell\open\command")
+        winreg.CloseKey(key)
+        return True
+    except FileNotFoundError:
+        pass
+
+    # Fallback: check the first protocol and verify it points to us
+    first_proto = next(iter(PROTOCOLS))
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, rf"{first_proto}\shell\open\command")
+        val, _ = winreg.QueryValueEx(key, "")
+        winreg.CloseKey(key)
+        return APP_NAME.lower() in val.lower()
+    except (FileNotFoundError, OSError):
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DOWNLOAD
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def download_file(url: str, dest: str) -> None:
+    """
+    Downloads url to dest using streaming chunks (no full-file memory load).
+    Adds Referer/Origin headers derived from the URL's own origin.
+    Raises urllib.error.HTTPError / urllib.error.URLError on failure.
+    """
+    parsed = urllib.parse.urlparse(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+
+    headers = {
+        **_DOWNLOAD_HEADERS,
+        "Referer":        origin + "/",
+        "Origin":         origin,
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+    }
+
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()),
+        urllib.request.HTTPRedirectHandler(),
+    )
+    req = urllib.request.Request(url, headers=headers)
+    with opener.open(req, timeout=30) as response, open(dest, "wb") as out:
+        shutil.copyfileobj(response, out)  # streams in chunks — safe for large files
+
+
+def extract_url(uri: str) -> Optional[str]:
+    """
+    Extracts a download URL from a slicer protocol URI.
+
+    Tries recognised query-parameter names first (file, model, url,
+    download_url, files), then falls back to the first 'http' substring.
+    Returns None if no URL can be found.
+    """
+    try:
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(uri).query)
+        for key in ("file", "model", "url", "download_url", "files"):
+            if key in params:
+                return urllib.parse.unquote(params[key][0])
     except Exception as e:
-        log(f"  parse_qs error: {e}")
+        log(f"  URL extraction (query params) failed: {e}")
 
     idx = uri.find("http")
     if idx != -1:
         return urllib.parse.unquote(uri[idx:].split("&")[0])
+
     return None
 
-def handle_protocol(uri: str):
-    log(f"\n--- NOVY KLIK ---")
-    log(f"argv: {sys.argv}")
+
+def _safe_extension(url: str, fallback: str = ".3mf") -> str:
+    """Returns the file extension from the URL path, or fallback if not recognised."""
+    ext = os.path.splitext(urllib.parse.urlparse(url).path)[1].lower()
+    return ext if ext in VALID_EXTENSIONS else fallback
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PROTOCOL HANDLER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _launch_slicer(slicer_path: str, *file_paths: str) -> None:
+    """Launches slicer_path with the given files. No console window."""
+    subprocess.Popen(
+        [slicer_path, *file_paths],
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+
+
+def handle_protocol(uri: str) -> None:
+    """Entry point for all protocol URIs. Routes multi-file URIs to handle_multi."""
+    log(f"\n--- PROTOCOL CLICK ---")
+    log(f"URI: {uri}")
+
+    if uri.startswith("slicerbridge://multi"):
+        handle_multi(uri)
+        return
+
+    cfg    = load_config()
+    slicer = cfg.get("slicer_path", "")
+
+    if not slicer or not os.path.isfile(slicer):
+        log("Slicer not configured — opening GUI")
+        show_gui(error="Slicer is not configured or was not found. Please select one below.")
+        return
+
+    log(f"Slicer: {slicer}")
+
+    url = extract_url(uri)
+    if not url:
+        log(f"Could not extract a download URL from: {uri}")
+        return
+
+    log(f"URL: {url}")
+
+    stamp  = int(time.time() * 1000) % 100_000
+    ext    = _safe_extension(url)
+    target = os.path.join(tempfile.gettempdir(), f"{TEMP_PREFIX}{stamp}{ext}")
+    log(f"Downloading to: {target}")
+
+    try:
+        cleanup_old_temp_files()
+        download_file(url, target)
+        log("Download OK — launching slicer")
+        _launch_slicer(slicer, target)
+        log("Slicer launched OK")
+    except urllib.error.HTTPError as e:
+        log(f"HTTP error: {e}\n{traceback.format_exc()}")
+    except urllib.error.URLError as e:
+        log(f"Network error: {e}\n{traceback.format_exc()}")
+    except Exception as e:
+        log(f"Unexpected error: {e}\n{traceback.format_exc()}")
+
+
+def handle_multi(uri: str) -> None:
+    """
+    Handles slicerbridge://multi?files=<url1>|<url2>|...&names=<name1>|<name2>|...
+    Downloads all files then opens the slicer with all of them at once.
+    """
+    log(f"\n--- MULTI-FILE ---")
     log(f"URI: {uri}")
 
     cfg    = load_config()
     slicer = cfg.get("slicer_path", "")
 
     if not slicer or not os.path.isfile(slicer):
-        log("Slicer not configured -> opening GUI")
+        log("Slicer not configured — opening GUI")
         show_gui(error="Slicer is not configured or was not found. Please select one below.")
         return
 
-    log(f"Slicer: {slicer}")
-
     try:
-        url = extract_url(uri)
-        if not url:
-            log(f"Could not extract URL from: {uri}")
+        params    = urllib.parse.parse_qs(urllib.parse.urlparse(uri).query)
+        raw_files = params.get("files", [""])[0]
+        raw_names = params.get("names", [""])[0]
+
+        urls  = [u for u in urllib.parse.unquote(raw_files).split("|") if u.strip()]
+        names = [n for n in urllib.parse.unquote(raw_names).split("|") if n.strip()]
+
+        if not urls:
+            log("No files to download")
             return
 
-        log(f"URL: {url}")
+        log(f"Downloading {len(urls)} file(s)...")
+        cleanup_old_temp_files()
 
-        parsed_url = urllib.parse.urlparse(url)
-        ext = os.path.splitext(parsed_url.path)[1].lower()
-        if ext not in VALID_EXT:
-            log(f"Neznámá přípona '{ext}', defaultuji na .3mf")
-            ext = ".3mf"
+        tmp_dir    = tempfile.mkdtemp(prefix=f"{TEMP_PREFIX}multi_")
+        downloaded = []
 
-        target = os.path.join(tempfile.gettempdir(), f"slicerbridge{ext}")
-        log(f"Stahuji do: {target}")
+        for i, url in enumerate(urls):
+            filename = (
+                names[i] if i < len(names) and names[i]
+                else os.path.basename(urllib.parse.urlparse(url).path) or f"model_{i + 1}.stl"
+            )
+            dest = os.path.join(tmp_dir, filename)
+            log(f"  [{i + 1}/{len(urls)}] {filename} ← {url}")
+            try:
+                download_file(url, dest)
+                downloaded.append(dest)
+                log(f"  OK: {dest}")
+            except Exception as e:
+                log(f"  FAILED {filename}: {e}")
 
-        # Build a Referer from the download URL's origin so sites like
-        # Thingiverse don't return 403 Forbidden.
-        origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
-        referer = origin + "/"
+        if not downloaded:
+            log("No files downloaded successfully")
+            return
 
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Referer":        referer,
-            "Origin":         origin,
-            "Accept":         "application/octet-stream,*/*;q=0.9",
-            "Accept-Language":"en-US,en;q=0.9",
-            "Accept-Encoding":"gzip, deflate, br",
-            "Connection":     "keep-alive",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "same-origin",
-            "Upgrade-Insecure-Requests": "1",
-        }
+        log(f"Downloaded {len(downloaded)}/{len(urls)} — launching slicer")
+        _launch_slicer(slicer, *downloaded)
+        log("Slicer launched OK")
 
-        # Some sites (Thingiverse) redirect through auth — follow up to 5 hops.
-        cookie_jar = http.cookiejar.CookieJar()
-        opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(cookie_jar),
-            urllib.request.HTTPRedirectHandler(),
-        )
-        req = urllib.request.Request(url, headers=headers)
-        with opener.open(req, timeout=30) as r, \
-             open(target, "wb") as f:
-            f.write(r.read())
-
-        log("Staženo OK. Spouštím slicer...")
-        subprocess.Popen(
-            [slicer, target],
-            creationflags=subprocess.CREATE_NO_WINDOW
-        )
-        log("Slicer spuštěn OK")
-
-    except urllib.error.HTTPError as e:
-        log(f"CHYBA stahování: {e}\n{traceback.format_exc()}")
-    except urllib.error.URLError as e:
-        log(f"CHYBA sítě: {e}\n{traceback.format_exc()}")
     except Exception as e:
-        log(f"CHYBA: {e}\n{traceback.format_exc()}")
+        log(f"Multi-file error: {e}\n{traceback.format_exc()}")
 
-# ═══════════════════════════════════════════════════════════════════════
-#  GUI
-# ═══════════════════════════════════════════════════════════════════════
 
-def show_gui(error: str = ""):
-    import tkinter as tk
-    from tkinter import filedialog, messagebox
+# ═══════════════════════════════════════════════════════════════════════════════
+# GUI — Theme
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    # ── Colour palette ────────────────────────────────────────────────
+class Theme:
     BG      = "#16161e"
     PANEL   = "#1a1b26"
     BORDER  = "#2a2b3d"
     ACCENT  = "#7aa2f7"
     GREEN   = "#9ece6a"
-    RED_C   = "#f7768e"
+    RED     = "#f7768e"
     YELLOW  = "#e0af68"
     GRAY    = "#565f89"
     FG      = "#c0caf5"
@@ -403,459 +574,493 @@ def show_gui(error: str = ""):
     FONT_LG = ("Segoe UI", 12, "bold")
     FONT_H  = ("Segoe UI", 18, "bold")
 
-    cfg     = load_config()
-    current_slicer  = cfg.get("slicer_path", "")
-    current_install = cfg.get("installed_exe", "")
-    found   = scan_slicers()
-    offer_install = needs_install()
 
-    TITLEBAR_H = 32
-    WIN_H = (660 if offer_install else 580) + TITLEBAR_H
+# ═══════════════════════════════════════════════════════════════════════════════
+# GUI — Widget helpers
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    root = tk.Tk()
-    root.overrideredirect(True)          # remove native titlebar
-    root.geometry(f"700x{WIN_H}")
-    root.configure(bg=BG)
+def _make_button(parent, text: str, cmd, *, primary=False, danger=False) -> None:
+    """Creates a flat styled button and packs it to the left."""
+    import tkinter as tk
 
-    # ── Custom titlebar ───────────────────────────────────────────────
-    tb = tk.Frame(root, bg=BORDER, height=TITLEBAR_H)
+    bg    = Theme.ACCENT if primary else (Theme.RED    if danger else Theme.BORDER)
+    fg    = Theme.BG     if primary else (Theme.BG     if danger else Theme.FG)
+    hover = Theme.GREEN  if primary else (Theme.RED    if danger else Theme.GRAY)
+    font  = ("Segoe UI", 10, "bold") if primary else Theme.FONT
+
+    tk.Button(
+        parent, text=text, command=cmd,
+        bg=bg, fg=fg, font=font,
+        relief="flat", cursor="hand2", padx=16, pady=7,
+        activebackground=hover, activeforeground=Theme.BG,
+    ).pack(side="left", padx=5)
+
+
+def _sep(parent) -> None:
+    """Draws a horizontal rule."""
+    import tkinter as tk
+    tk.Frame(parent, bg=Theme.BORDER, height=1).pack(fill="x", padx=28, pady=10)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GUI — Section builders
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _build_titlebar(root) -> None:
+    """Custom frameless titlebar with drag, minimize, and close."""
+    import tkinter as tk
+
+    tb = tk.Frame(root, bg=Theme.BORDER, height=32)
     tb.pack(fill="x", side="top")
     tb.pack_propagate(False)
 
-    tk.Label(tb, text="⬡  SlicerBridge", bg=BORDER, fg=FG,
-             font=("Segoe UI", 10, "bold")).pack(side="left", padx=12, pady=6)
-
-    def _close():  root.destroy()
+    tk.Label(
+        tb, text="⬡  SlicerBridge",
+        bg=Theme.BORDER, fg=Theme.FG, font=("Segoe UI", 10, "bold"),
+    ).pack(side="left", padx=12, pady=6)
 
     def _minimize():
         root.overrideredirect(False)
         root.iconify()
 
-    def _on_map(e):
-        root.overrideredirect(True)
+    root.bind("<Map>", lambda e: root.overrideredirect(True))
 
-    root.bind("<Map>", _on_map)
-
-    for txt, cmd, hover in [("✕", _close, RED_C), ("─", _minimize, GRAY)]:
-        b = tk.Label(tb, text=txt, bg=BORDER, fg=GRAY,
+    for txt, cmd, hover_color in [("✕", root.destroy, Theme.RED), ("─", _minimize, Theme.GRAY)]:
+        b = tk.Label(tb, text=txt, bg=Theme.BORDER, fg=Theme.GRAY,
                      font=("Segoe UI", 11), cursor="hand2", padx=12)
         b.pack(side="right")
         b.bind("<Button-1>", lambda e, c=cmd: c())
-        b.bind("<Enter>",    lambda e, w=b, h=hover: w.configure(fg=h, bg="#3a3b4d"))
-        b.bind("<Leave>",    lambda e, w=b: w.configure(fg=GRAY, bg=BORDER))
+        b.bind("<Enter>",    lambda e, w=b, h=hover_color: w.configure(fg=h, bg="#3a3b4d"))
+        b.bind("<Leave>",    lambda e, w=b: w.configure(fg=Theme.GRAY, bg=Theme.BORDER))
 
-    # Drag support
-    _drag = {}
-    def _drag_start(e): _drag["x"], _drag["y"] = e.x, e.y
-    def _drag_move(e):
-        root.geometry(f"+{root.winfo_x()+e.x-_drag['x']}+{root.winfo_y()+e.y-_drag['y']}")
-    tb.bind("<Button-1>",   _drag_start)
-    tb.bind("<B1-Motion>",  _drag_move)
+    drag: dict = {}
+    tb.bind("<Button-1>",  lambda e: drag.update(x=e.x, y=e.y))
+    tb.bind("<B1-Motion>", lambda e: root.geometry(
+        f"+{root.winfo_x() + e.x - drag['x']}+{root.winfo_y() + e.y - drag['y']}"
+    ))
 
-    def sep():
-        tk.Frame(root, bg=BORDER, height=1).pack(fill="x", padx=28, pady=10)
 
-    # ── Header ────────────────────────────────────────────────────────
-    tk.Label(root, text="⬡  SlicerBridge",
-             bg=BG, fg=ACCENT, font=FONT_H).pack(anchor="w", padx=28, pady=(22, 0))
+def _build_install_section(root, install_dir_var, move_var) -> None:
+    """Step 1: choose install location (only shown when running from a staging folder)."""
+    import tkinter as tk
+    from tkinter import filedialog
+
+    tk.Label(root, text="Step 1 — Choose install location",
+             bg=Theme.BG, fg=Theme.FG, font=Theme.FONT_LG).pack(anchor="w", padx=28)
     tk.Label(root,
-             text="Redirects all slicer protocols to your preferred slicer.",
-             bg=BG, fg=GRAY, font=FONT_SM).pack(anchor="w", padx=30)
+             text="SlicerBridge will copy itself here so it works permanently.\n"
+                  "Default is Program Files (x86) — you can change it below.",
+             bg=Theme.BG, fg=Theme.GRAY, font=Theme.FONT_SM).pack(anchor="w", padx=30, pady=(2, 8))
 
-    sep()
+    row = tk.Frame(root, bg=Theme.BG)
+    row.pack(fill="x", padx=28, pady=4)
 
-    # ── SECTION 1: Install location (shown when running from Downloads etc.) ──
-    install_dir_var = tk.StringVar()
+    tk.Entry(row, textvariable=install_dir_var, width=52,
+             bg=Theme.PANEL, fg=Theme.FG, insertbackground=Theme.FG,
+             relief="flat", font=Theme.FONT, bd=6).pack(side="left", padx=(0, 8))
 
-    if offer_install:
-        tk.Label(root, text="Step 1 — Choose install location",
-                 bg=BG, fg=FG, font=FONT_LG).pack(anchor="w", padx=28)
-        tk.Label(root,
-                 text="SlicerBridge will copy itself to this folder so it works permanently.\n"
-                      "Default is Program Files (x86) — you can change it below.",
-                 bg=BG, fg=GRAY, font=FONT_SM).pack(anchor="w", padx=30, pady=(2, 8))
+    def browse():
+        p = filedialog.askdirectory(title="Choose install folder")
+        if p:
+            install_dir_var.set(p.replace("/", "\\"))
 
-        # Suggest Program Files (x86) by default, or current installed location
-        install_dir_var.set(
-            os.path.dirname(current_install) if current_install
-            else INSTALL_DIR_DEF
-        )
+    tk.Button(row, text="Browse…", bg=Theme.BORDER, fg=Theme.FG, relief="flat",
+              font=Theme.FONT, activebackground=Theme.ACCENT, activeforeground=Theme.BG,
+              cursor="hand2", command=browse, padx=10).pack(side="left")
 
-        inst_frame = tk.Frame(root, bg=BG)
-        inst_frame.pack(fill="x", padx=28, pady=4)
+    tk.Checkbutton(
+        root,
+        text="Move file to install location (removes it from Downloads)",
+        variable=move_var,
+        bg=Theme.BG, fg=Theme.FG, selectcolor=Theme.BG,
+        activebackground=Theme.BG, activeforeground=Theme.ACCENT,
+        font=Theme.FONT_SM, cursor="hand2",
+    ).pack(anchor="w", padx=28, pady=(4, 0))
 
-        inst_entry = tk.Entry(
-            inst_frame, textvariable=install_dir_var, width=52,
-            bg=PANEL, fg=FG, insertbackground=FG,
-            relief="flat", font=FONT, bd=6
-        )
-        inst_entry.pack(side="left", padx=(0, 8))
+    # Quick-pick shortcuts
+    picks = tk.Frame(root, bg=Theme.BG)
+    picks.pack(anchor="w", padx=28, pady=(4, 0))
+    tk.Label(picks, text="Quick pick: ", bg=Theme.BG, fg=Theme.GRAY,
+             font=Theme.FONT_SM).pack(side="left")
+    for label, path in [
+        ("Program Files (x86)", r"C:\Program Files (x86)\SlicerBridge"),
+        ("Program Files",       r"C:\Program Files\SlicerBridge"),
+        ("AppData",             os.path.join(os.environ.get("APPDATA", ""), APP_NAME)),
+    ]:
+        tk.Button(picks, text=label, bg=Theme.FG_DIM, fg=Theme.FG, relief="flat",
+                  font=Theme.FONT_SM, activebackground=Theme.GRAY, activeforeground=Theme.BG,
+                  cursor="hand2", padx=6, pady=2,
+                  command=lambda p=path: install_dir_var.set(p)).pack(side="left", padx=3)
 
-        def browse_install():
-            p = filedialog.askdirectory(title="Choose install folder")
-            if p:
-                install_dir_var.set(p.replace("/", "\\"))
+    _sep(root)
 
-        tk.Button(
-            inst_frame, text="Browse…",
-            bg=BORDER, fg=FG, relief="flat", font=FONT,
-            activebackground=ACCENT, activeforeground=BG,
-            cursor="hand2", command=browse_install, padx=10
-        ).pack(side="left")
 
-        # Move vs copy checkbox
-        move_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(
-            root,
-            text="Move file to install location (removes it from Downloads)",
-            variable=move_var,
-            bg=BG, fg=FG, selectcolor=BG,
-            activebackground=BG, activeforeground=ACCENT,
-            font=FONT_SM, cursor="hand2",
-        ).pack(anchor="w", padx=28, pady=(4, 0))
+def _build_slicer_section(root, found_slicers, current_slicer,
+                           sel_var, manual_var, section_title: str) -> None:
+    """Slicer selection: radio buttons for auto-detected slicers + manual browse."""
+    import tkinter as tk
+    from tkinter import filedialog
 
-        # Quick-pick shortcuts
-        picks_frame = tk.Frame(root, bg=BG)
-        picks_frame.pack(anchor="w", padx=28, pady=(4, 0))
-        tk.Label(picks_frame, text="Quick pick: ", bg=BG, fg=GRAY,
-                 font=FONT_SM).pack(side="left")
-        for label, path in [
-            ("Program Files (x86)", r"C:\Program Files (x86)\SlicerBridge"),
-            ("Program Files",       r"C:\Program Files\SlicerBridge"),
-            ("AppData",             os.path.join(os.environ.get("APPDATA",""), "SlicerBridge")),
-        ]:
-            tk.Button(
-                picks_frame, text=label,
-                bg=FG_DIM, fg=FG, relief="flat", font=FONT_SM,
-                activebackground=GRAY, activeforeground=BG,
-                cursor="hand2", padx=6, pady=2,
-                command=lambda p=path: install_dir_var.set(p)
-            ).pack(side="left", padx=3)
-
-        sep()
-        step2_label = "Step 2 — Choose your slicer"
-    else:
-        step2_label = "Target slicer"
-
-    # ── SECTION 2: Slicer selection ───────────────────────────────────
-    tk.Label(root, text=step2_label,
-             bg=BG, fg=FG, font=FONT_LG).pack(anchor="w", padx=28)
+    tk.Label(root, text=section_title, bg=Theme.BG, fg=Theme.FG,
+             font=Theme.FONT_LG).pack(anchor="w", padx=28)
     tk.Label(root, text="All intercepted protocols will open models in this slicer.",
-             bg=BG, fg=GRAY, font=FONT_SM).pack(anchor="w", padx=30, pady=(2, 8))
+             bg=Theme.BG, fg=Theme.GRAY, font=Theme.FONT_SM).pack(anchor="w", padx=30, pady=(2, 8))
 
-    sel_var = tk.StringVar()
-
-    list_frame = tk.Frame(root, bg=PANEL)
+    list_frame = tk.Frame(root, bg=Theme.PANEL)
     list_frame.pack(fill="x", padx=28, ipady=4)
 
-    if found:
-        for slicer_def, path in found:
-            row = tk.Frame(list_frame, bg=PANEL)
+    if found_slicers:
+        for slicer_def, path in found_slicers:
+            row = tk.Frame(list_frame, bg=Theme.PANEL)
             row.pack(fill="x", padx=12, pady=3)
-            tk.Radiobutton(
-                row, text=f"  {slicer_def['name']}",
-                variable=sel_var, value=path,
-                bg=PANEL, fg=FG, selectcolor=BG,
-                activebackground=PANEL, activeforeground=ACCENT,
-                font=FONT, cursor="hand2"
-            ).pack(side="left")
-            tk.Label(row, text=f"  {path}",
-                     bg=PANEL, fg=GRAY, font=FONT_SM).pack(side="left")
+            tk.Radiobutton(row, text=f"  {slicer_def['name']}", variable=sel_var, value=path,
+                           bg=Theme.PANEL, fg=Theme.FG, selectcolor=Theme.BG,
+                           activebackground=Theme.PANEL, activeforeground=Theme.ACCENT,
+                           font=Theme.FONT, cursor="hand2").pack(side="left")
+            tk.Label(row, text=f"  {path}", bg=Theme.PANEL, fg=Theme.GRAY,
+                     font=Theme.FONT_SM).pack(side="left")
 
         sel_var.set(
             current_slicer if current_slicer and os.path.isfile(current_slicer)
-            else found[0][1]
+            else found_slicers[0][1]
         )
     else:
         tk.Label(list_frame,
                  text="  ⚠  No slicer found automatically — enter the path below.",
-                 bg=PANEL, fg=RED_C, font=FONT).pack(anchor="w", padx=12, pady=10)
+                 bg=Theme.PANEL, fg=Theme.RED, font=Theme.FONT).pack(anchor="w", padx=12, pady=10)
 
-    # ── Manual slicer path ────────────────────────────────────────────
-    sep()
-    tk.Label(root, text="Or enter the path manually (.exe)",
-             bg=BG, fg=FG, font=FONT).pack(anchor="w", padx=28)
+    _sep(root)
+    tk.Label(root, text="Or enter the path manually (.exe)", bg=Theme.BG, fg=Theme.FG,
+             font=Theme.FONT).pack(anchor="w", padx=28)
 
-    manual_frame = tk.Frame(root, bg=BG)
-    manual_frame.pack(fill="x", padx=28, pady=6)
+    mf = tk.Frame(root, bg=Theme.BG)
+    mf.pack(fill="x", padx=28, pady=6)
+    tk.Entry(mf, textvariable=manual_var, width=56, bg=Theme.PANEL, fg=Theme.FG,
+             insertbackground=Theme.FG, relief="flat", font=Theme.FONT, bd=6).pack(side="left", padx=(0, 8))
 
-    manual_var = tk.StringVar()
-    tk.Entry(
-        manual_frame, textvariable=manual_var, width=56,
-        bg=PANEL, fg=FG, insertbackground=FG,
-        relief="flat", font=FONT, bd=6
-    ).pack(side="left", padx=(0, 8))
-
-    def browse_slicer():
+    def browse():
         p = filedialog.askopenfilename(
             title="Select slicer .exe",
-            filetypes=[("Executable", "*.exe"), ("All files", "*.*")]
+            filetypes=[("Executable", "*.exe"), ("All files", "*.*")],
         )
         if p:
             manual_var.set(p)
             sel_var.set("")
 
-    tk.Button(
-        manual_frame, text="Browse…",
-        bg=BORDER, fg=FG, relief="flat", font=FONT,
-        activebackground=ACCENT, activeforeground=BG,
-        cursor="hand2", command=browse_slicer, padx=10
-    ).pack(side="left")
+    tk.Button(mf, text="Browse…", bg=Theme.BORDER, fg=Theme.FG, relief="flat", font=Theme.FONT,
+              activebackground=Theme.ACCENT, activeforeground=Theme.BG,
+              cursor="hand2", command=browse, padx=10).pack(side="left")
 
-    # ── Status line ───────────────────────────────────────────────────
-    status_var = tk.StringVar(value=error)
-    status_lbl = tk.Label(root, textvariable=status_var,
-                          bg=BG, fg=RED_C if error else GRAY, font=FONT_SM)
-    status_lbl.pack(anchor="w", padx=30, pady=(6, 0))
 
-    # ── Protocols info ────────────────────────────────────────────────
-    tk.Label(root, text="Intercepted: " + "  ".join(PROTOCOLS.keys()),
-             bg=BG, fg=FG_DIM, font=FONT_SM).pack(anchor="w", padx=28, pady=(4, 0))
+def _build_uninstall_section(root, status_var, status_lbl) -> None:
+    """Danger zone — only shown when registry entries already exist."""
+    import tkinter as tk
+    from tkinter import messagebox
 
-    sep()
+    frame = tk.Frame(root, bg=Theme.BG)
+    frame.pack(anchor="w", padx=28, pady=(0, 4))
+    tk.Label(frame, text="Danger zone", bg=Theme.BG, fg=Theme.GRAY,
+             font=Theme.FONT_SM).pack(side="left", padx=(0, 12))
 
-    # ── Install button ────────────────────────────────────────────────
-    def do_install():
-        chosen_slicer = manual_var.get().strip() or sel_var.get()
-
-        if not chosen_slicer:
-            status_var.set("⚠  Please select a slicer or enter its path.")
-            status_lbl.configure(fg=RED_C)
+    def do_uninstall():
+        if not messagebox.askyesno(
+            "Uninstall SlicerBridge",
+            "This will remove all registry entries.\n\n"
+            "Your slicer and downloaded models are NOT affected.\n\nContinue?",
+            icon="warning",
+        ):
             return
-        if not os.path.isfile(chosen_slicer):
-            status_var.set(f"⚠  File not found: {chosen_slicer}")
-            status_lbl.configure(fg=RED_C)
-            return
-
-        # Determine where the handler exe will live.
-        # NOTE: we do NOT copy here — copying to Program Files needs admin,
-        # so the actual copy+registry write both happen inside --register
-        # (the UAC-elevated process).  We only need to know the destination.
-        if offer_install:
-            dest_dir = install_dir_var.get().strip()
-            if not dest_dir:
-                status_var.set("⚠  Please enter an install directory.")
-                status_lbl.configure(fg=RED_C)
-                return
-            handler_exe = os.path.join(dest_dir, EXE_NAME)
-        else:
-            dest_dir    = ""
-            handler_exe = sys.executable
-
-        # Persist everything the elevated process will need
-        save_config({
-            "slicer_path":   chosen_slicer,
-            "installed_exe": handler_exe,
-            "handler_exe":   handler_exe,
-            "install_dir":   dest_dir,
-            "source_exe":    sys.executable,   # so --register knows what to move
-        })
-
         if not is_admin():
+            status_lbl.configure(fg=Theme.YELLOW)
             status_var.set("Requesting admin rights (UAC)…")
-            status_lbl.configure(fg=YELLOW)
             root.update()
-            # Elevate from the CURRENT exe (still in Downloads / wherever)
-            ctypes.windll.shell32.ShellExecuteW(
-                None, "runas",
-                sys.executable, "--register",
-                None, 1
-            )
+            ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, "--uninstall", None, 1)
             root.after(2000, root.destroy)
             return
-
-        _write(handler_exe, chosen_slicer)
-
-    def _write(handler_exe, slicer):
-        try:
-            write_registry(handler_exe)
-            status_lbl.configure(fg=GREEN)
-            status_var.set(
-                f"✓  Done! {len(PROTOCOLS)} protocols registered  →  "
-                f"{os.path.basename(slicer)}"
-            )
-        except PermissionError:
-            status_lbl.configure(fg=RED_C)
-            status_var.set("✗  Permission denied. Please run as Administrator.")
-        except Exception as e:
-            status_lbl.configure(fg=RED_C)
-            status_var.set(f"✗  Error: {e}")
-
-    btn_frame = tk.Frame(root, bg=BG)
-    btn_frame.pack(pady=4)
-
-    def mkbtn(parent, text, cmd, primary=False, danger=False):
-        c_bg = ACCENT if primary else (RED_C if danger else BORDER)
-        c_fg = BG    if primary else (BG     if danger else FG)
-        c_ho = GREEN if primary else (RED_C  if danger else GRAY)
-        tk.Button(
-            parent, text=text, command=cmd,
-            bg=c_bg, fg=c_fg,
-            font=("Segoe UI", 10, "bold") if primary else FONT,
-            relief="flat", cursor="hand2", padx=16, pady=7,
-            activebackground=c_ho, activeforeground=BG
-        ).pack(side="left", padx=5)
-
-    mkbtn(btn_frame, "  ✓  Install  ", do_install, primary=True)
-    mkbtn(btn_frame, "Open log",
-          lambda: os.startfile(LOG_FILE) if os.path.isfile(LOG_FILE)
-          else status_var.set("No log yet."))
-    mkbtn(btn_frame, "Config folder",
-          lambda: (os.makedirs(CONFIG_DIR, exist_ok=True),
-                   os.startfile(CONFIG_DIR)))
-
-    # ── Uninstall (only shown when registry entries actually exist) ──────
-    if is_registered():
-        sep()
-        uninstall_frame = tk.Frame(root, bg=BG)
-        uninstall_frame.pack(anchor="w", padx=28, pady=(0, 4))
-        tk.Label(uninstall_frame, text="Danger zone",
-                 bg=BG, fg=GRAY, font=FONT_SM).pack(side="left", padx=(0, 12))
-
-        def do_uninstall():
-            from tkinter import messagebox
-            if not messagebox.askyesno(
-                "Uninstall SlicerBridge",
-                "This will remove all registry entries.\n\n"
-                "Your slicer and downloaded models are NOT affected.\n\n"
-                "Continue?",
-                icon="warning"
-            ):
-                return
-            if not is_admin():
-                status_var.set("Requesting admin rights (UAC)…")
-                status_lbl.configure(fg=YELLOW)
-                root.update()
-                ctypes.windll.shell32.ShellExecuteW(
-                    None, "runas",
-                    sys.executable, "--uninstall",
-                    None, 1
-                )
-                root.after(2000, root.destroy)
-                return
-            try:
-                remove_registry()
-                # Delete config entirely so next launch shows Step 1
-                try:
-                    os.remove(CONFIG_FILE)
-                except FileNotFoundError:
-                    pass
-                status_lbl.configure(fg=GREEN)
-                status_var.set("✓  Uninstalled. You can delete SlicerBridge.exe manually.")
-            except Exception as e:
-                status_lbl.configure(fg=RED_C)
-                status_var.set(f"✗  {e}")
-
-        mkbtn(uninstall_frame, "  ✗  Uninstall  ", do_uninstall, danger=True)
-
-    # ── Footer ────────────────────────────────────────────────────────
-    tk.Frame(root, bg=BORDER, height=1).pack(fill="x", padx=28, pady=(12, 4))
-    footer_frame = tk.Frame(root, bg=BG)
-    footer_frame.pack(fill="x", padx=28, pady=(0, 14))
-
-    tk.Label(footer_frame,
-             text=f"v{VERSION}  ·  built {get_build_date()}",
-             bg=BG, fg=FG_DIM, font=FONT_SM).pack(side="left")
-
-    gh_lbl = tk.Label(footer_frame, text="GitHub ↗",
-                      bg=BG, fg=ACCENT, font=FONT_SM, cursor="hand2")
-    gh_lbl.pack(side="right")
-    gh_lbl.bind("<Button-1>", lambda e: __import__("webbrowser").open(
-        "https://github.com/LukysGaming/SlicerBridge"))
-    gh_lbl.bind("<Enter>", lambda e: gh_lbl.configure(fg=FG))
-    gh_lbl.bind("<Leave>", lambda e: gh_lbl.configure(fg=ACCENT))
-
-    root.mainloop()
-
-# ═══════════════════════════════════════════════════════════════════════
-#  ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════════
-
-def _is_protocol_uri(s: str) -> bool:
-    return any(s.startswith(p + "://") for p in PROTOCOLS)
-
-if __name__ == "__main__":
-    args = sys.argv[1:]
-
-    if args and args[0] == "--register":
-        # Called automatically by the GUI after UAC elevation.
-        # This process has admin rights, so it can:
-        #   1. Create the install directory and copy/move the exe there
-        #   2. Write the registry
-        if not is_admin():
-            sys.exit(1)
-        import tkinter as tk
-        from tkinter import messagebox
-        cfg        = load_config()
-        dest_dir   = cfg.get("install_dir", "")
-        source_exe = cfg.get("source_exe", sys.executable)
-        slicer     = cfg.get("slicer_path", "???")
-        try:
-            # Step 1 — move exe to its permanent home (if a dest_dir was chosen)
-            if dest_dir:
-                handler_exe = move_to_install_dir(dest_dir)
-                # Update config so future launches use the new path
-                cfg["installed_exe"] = handler_exe
-                cfg["handler_exe"]   = handler_exe
-                save_config(cfg)
-            else:
-                handler_exe = sys.executable
-
-            # Step 2 — write registry pointing to the new location
-            write_registry(handler_exe)
-
-            r = tk.Tk(); r.withdraw()
-            messagebox.showinfo(
-                "SlicerBridge — Installed",
-                f"Installation complete!\n\n"
-                f"{len(PROTOCOLS)} protocols registered.\n\n"
-                f"Handler:  {handler_exe}\n"
-                f"Slicer:   {slicer}"
-            )
-            r.destroy()
-        except Exception as e:
-            r = tk.Tk(); r.withdraw()
-            messagebox.showerror("SlicerBridge — Error", str(e))
-            r.destroy()
-        sys.exit(0)
-
-    elif args and args[0] == "--uninstall":
-        # Called by the GUI Uninstall button after UAC elevation
-        if not is_admin():
-            sys.exit(1)
-        import tkinter as tk
-        from tkinter import messagebox
-        r = tk.Tk(); r.withdraw()
         try:
             remove_registry()
             try:
                 os.remove(CONFIG_FILE)
             except FileNotFoundError:
                 pass
-            messagebox.showinfo(
-                "SlicerBridge — Uninstalled",
-                f"All {len(PROTOCOLS)} protocol registrations removed.\n\n"
-                "You can now delete SlicerBridge.exe from its install folder."
-            )
+            status_lbl.configure(fg=Theme.GREEN)
+            status_var.set("✓  Uninstalled. Registry cleared and config removed.")
         except Exception as e:
-            messagebox.showerror("SlicerBridge — Error", str(e))
-        r.destroy()
-        sys.exit(0)
+            status_lbl.configure(fg=Theme.RED)
+            status_var.set(f"✗  {e}")
 
-    elif args and args[0] == "--reset":
-        # Developer helper: wipe config so the next launch shows Step 1 again.
-        # Usage: SlicerBridge.exe --reset
+    _make_button(frame, "  ✗  Uninstall  ", do_uninstall, danger=True)
+
+
+def _build_footer(root) -> None:
+    import tkinter as tk
+
+    tk.Frame(root, bg=Theme.BORDER, height=1).pack(fill="x", padx=28, pady=(12, 4))
+    footer = tk.Frame(root, bg=Theme.BG)
+    footer.pack(fill="x", padx=28, pady=(0, 14))
+
+    tk.Label(footer, text=f"v{VERSION}  ·  built {get_build_date()}",
+             bg=Theme.BG, fg=Theme.FG_DIM, font=Theme.FONT_SM).pack(side="left")
+
+    gh = tk.Label(footer, text="GitHub ↗", bg=Theme.BG, fg=Theme.ACCENT,
+                  font=Theme.FONT_SM, cursor="hand2")
+    gh.pack(side="right")
+    gh.bind("<Button-1>", lambda e: webbrowser.open("https://github.com/LukysGaming/SlicerBridge"))
+    gh.bind("<Enter>",    lambda e: gh.configure(fg=Theme.FG))
+    gh.bind("<Leave>",    lambda e: gh.configure(fg=Theme.ACCENT))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GUI — Main window
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def show_gui(error: str = "") -> None:
+    import tkinter as tk
+
+    cfg             = load_config()
+    current_slicer  = cfg.get("slicer_path", "")
+    current_install = cfg.get("installed_exe", "")
+    found_slicers   = scan_slicers()
+    offer_install   = needs_install()
+
+    TITLEBAR_H = 32
+    win_height  = (660 if offer_install else 580) + TITLEBAR_H
+
+    root = tk.Tk()
+    root.overrideredirect(True)
+    root.geometry(f"700x{win_height}")
+    root.configure(bg=Theme.BG)
+
+    _build_titlebar(root)
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    tk.Label(root, text="⬡  SlicerBridge",
+             bg=Theme.BG, fg=Theme.ACCENT, font=Theme.FONT_H).pack(anchor="w", padx=28, pady=(22, 0))
+    tk.Label(root, text="Redirects all slicer protocols to your preferred slicer.",
+             bg=Theme.BG, fg=Theme.GRAY, font=Theme.FONT_SM).pack(anchor="w", padx=30)
+    _sep(root)
+
+    # ── Section 1: Install location (only on first run / staging folder) ──────
+    install_dir_var = tk.StringVar(value=(
+        os.path.dirname(current_install) if current_install else INSTALL_DIR_DEF
+    ))
+    move_var = tk.BooleanVar(value=True)
+
+    if offer_install:
+        _build_install_section(root, install_dir_var, move_var)
+        step2_label = "Step 2 — Choose your slicer"
+    else:
+        step2_label = "Target slicer"
+
+    # ── Section 2: Slicer selection ───────────────────────────────────────────
+    sel_var    = tk.StringVar()
+    manual_var = tk.StringVar()
+    _build_slicer_section(root, found_slicers, current_slicer, sel_var, manual_var, step2_label)
+
+    # ── Status line ───────────────────────────────────────────────────────────
+    status_var = tk.StringVar(value=error)
+    status_lbl = tk.Label(root, textvariable=status_var,
+                          bg=Theme.BG, fg=Theme.RED if error else Theme.GRAY,
+                          font=Theme.FONT_SM)
+    status_lbl.pack(anchor="w", padx=30, pady=(6, 0))
+
+    tk.Label(root, text="Intercepted: " + "  ".join(PROTOCOLS.keys()),
+             bg=Theme.BG, fg=Theme.FG_DIM, font=Theme.FONT_SM).pack(anchor="w", padx=28, pady=(4, 0))
+    _sep(root)
+
+    # ── Install button ────────────────────────────────────────────────────────
+    btn_frame = tk.Frame(root, bg=Theme.BG)
+    btn_frame.pack(pady=4)
+
+    def do_install():
+        chosen = manual_var.get().strip() or sel_var.get()
+        if not chosen:
+            status_lbl.configure(fg=Theme.RED)
+            status_var.set("⚠  Please select a slicer or enter its path.")
+            return
+        if not os.path.isfile(chosen):
+            status_lbl.configure(fg=Theme.RED)
+            status_var.set(f"⚠  File not found: {chosen}")
+            return
+
+        if offer_install:
+            dest_dir = install_dir_var.get().strip()
+            if not dest_dir:
+                status_lbl.configure(fg=Theme.RED)
+                status_var.set("⚠  Please enter an install directory.")
+                return
+            handler_exe = os.path.join(dest_dir, EXE_NAME)
+        else:
+            dest_dir    = ""
+            handler_exe = sys.executable
+
+        save_config({
+            "slicer_path":   chosen,
+            "installed_exe": handler_exe,
+            "handler_exe":   handler_exe,
+            "install_dir":   dest_dir,
+            "source_exe":    sys.executable,
+            "move_source":   move_var.get() if offer_install else False,
+        })
+
+        if not is_admin():
+            status_lbl.configure(fg=Theme.YELLOW)
+            status_var.set("Requesting admin rights (UAC)…")
+            root.update()
+            ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, "--register", None, 1)
+            root.after(2000, root.destroy)
+            return
+
+        # Already admin (user ran as admin directly — uncommon but valid)
+        try:
+            write_registry(handler_exe)
+            status_lbl.configure(fg=Theme.GREEN)
+            status_var.set(f"✓  Done! {len(PROTOCOLS)} protocols registered → {os.path.basename(chosen)}")
+        except PermissionError:
+            status_lbl.configure(fg=Theme.RED)
+            status_var.set("✗  Permission denied. Please run as Administrator.")
+        except Exception as e:
+            status_lbl.configure(fg=Theme.RED)
+            status_var.set(f"✗  {e}")
+
+    _make_button(btn_frame, "  ✓  Install  ", do_install, primary=True)
+    _make_button(btn_frame, "Open log",
+                 lambda: os.startfile(LOG_FILE) if os.path.isfile(LOG_FILE) else status_var.set("No log yet."))
+    _make_button(btn_frame, "Config folder",
+                 lambda: (os.makedirs(CONFIG_DIR, exist_ok=True), os.startfile(CONFIG_DIR)))
+
+    # ── Uninstall (danger zone) — only when already registered ───────────────
+    if is_registered():
+        _sep(root)
+        _build_uninstall_section(root, status_var, status_lbl)
+
+    _build_footer(root)
+    root.mainloop()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLI MODES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _cmd_register() -> None:
+    """--register: UAC-elevated subprocess — copies exe to install dir, writes registry."""
+    import tkinter as tk
+    from tkinter import messagebox
+
+    if not is_admin():
+        sys.exit(1)
+
+    cfg    = load_config()
+    dest_dir = cfg.get("install_dir", "")
+    slicer   = cfg.get("slicer_path", "???")
+
+    r = tk.Tk(); r.withdraw()
+    try:
+        if dest_dir:
+            handler_exe = move_to_install_dir(dest_dir, remove_source=cfg.get("move_source", True))
+            cfg["installed_exe"] = handler_exe
+            cfg["handler_exe"]   = handler_exe
+            save_config(cfg)
+        else:
+            handler_exe = sys.executable
+
+        write_registry(handler_exe)
+
+        messagebox.showinfo(
+            "SlicerBridge — Installed",
+            f"Installation complete!\n\n"
+            f"{len(PROTOCOLS)} protocols registered.\n\n"
+            f"Handler: {handler_exe}\n"
+            f"Slicer:  {slicer}",
+        )
+    except Exception as e:
+        messagebox.showerror("SlicerBridge — Error", str(e))
+    finally:
+        r.destroy()
+
+
+def _cmd_uninstall() -> None:
+    """--uninstall: UAC-elevated subprocess — removes registry entries and install folder."""
+    import tkinter as tk
+    from tkinter import messagebox
+
+    if not is_admin():
+        sys.exit(1)
+
+    cfg           = load_config()
+    installed_exe = cfg.get("installed_exe", "")
+
+    r = tk.Tk(); r.withdraw()
+    try:
+        remove_registry()
+
         try:
             os.remove(CONFIG_FILE)
-            print(f"Config deleted: {CONFIG_FILE}")
         except FileNotFoundError:
-            print("No config found — already clean.")
-        sys.exit(0)
+            pass
 
-    elif args and _is_protocol_uri(args[0]):
-        # Silent protocol handler mode
-        handle_protocol(args[0])
+        exe_note = ""
+        if installed_exe:
+            install_dir = os.path.dirname(installed_exe)
+            target      = install_dir if os.path.isdir(install_dir) else installed_exe
+            try:
+                if os.path.isdir(target):
+                    shutil.rmtree(target)
+                else:
+                    os.remove(target)
+                exe_note = f"\nInstall folder removed: {install_dir}"
+            except OSError:
+                exe_note = f"\nCould not remove install folder: {install_dir}"
 
+        messagebox.showinfo(
+            "SlicerBridge — Uninstalled",
+            f"All {len(PROTOCOLS)} protocol registrations removed.{exe_note}",
+        )
+    except Exception as e:
+        messagebox.showerror("SlicerBridge — Error", str(e))
+    finally:
+        r.destroy()
+
+
+def _cmd_reset() -> None:
+    """--reset: developer helper — wipes config so the next launch shows Step 1."""
+    try:
+        os.remove(CONFIG_FILE)
+        print(f"Config deleted: {CONFIG_FILE}")
+    except FileNotFoundError:
+        print("No config found — already clean.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main() -> None:
+    args = sys.argv[1:]
+
+    if not args:
+        show_gui()
+        return
+
+    cmd = args[0]
+
+    if cmd == "--register":
+        _cmd_register()
+    elif cmd == "--uninstall":
+        _cmd_uninstall()
+    elif cmd == "--reset":
+        _cmd_reset()
+    elif any(cmd.startswith(p + "://") for p in PROTOCOLS):
+        handle_protocol(cmd)
     else:
+<<<<<<< HEAD
         # GUI configurator / installer
         show_gui()
+=======
+        log(f"Unknown argument: {cmd!r} — falling back to GUI")
+        show_gui()
+
+
+if __name__ == "__main__":
+    main()
+>>>>>>> 50f977c (Fix stuff, add tampermonkey script, add a tool to open from printables)

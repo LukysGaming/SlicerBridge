@@ -100,13 +100,15 @@ To change your slicer later: just run `SlicerBridge.exe` again, pick a different
 
 ---
 
-## Tampermonkey (optional but recommended)
+## Tampermonkey (Printables Companion)
 
-For the best experience on MakerWorld and Printables, install the companion Tampermonkey userscript — it renames the "Open in Bambu Studio" / "Open in PrusaSlicer" buttons to your slicer's name and prevents tab-closing shenanigans on MakerWorld.
+To get the most out of SlicerBridge on Printables, install the companion Tampermonkey userscript. It injects a "⬡ Open in Slicer" button next to every folder, plus an "⬡ Open ALL in Slicer" button to grab everything at once.
 
-> Script coming soon / see `tampermonkey.js`
+> **[Install from GreasyFork](https://greasyfork.org/en/scripts/576211-slicerbridge)** (Recommended)
+> *Alternatively, you can install it manually by copying the contents of `slicerbridge.user.js` into a new Tampermonkey script.*
 
----
+### Planned
+* 3d model sites support (renaming the native "Open in XXX" buttons to your actual slicer).
 
 ## License
 
