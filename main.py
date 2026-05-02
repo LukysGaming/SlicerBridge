@@ -379,6 +379,12 @@ def _show_update_prompt(new_version: str, download_url: str) -> None:
              font=("Segoe UI", 11), cursor="hand2", padx=10).pack(side="right")\
         .bind("<Button-1>", lambda e: root.destroy())
 
+    drag: dict = {}
+    tb.bind("<Button-1>",  lambda e: drag.update(x=e.x, y=e.y))
+    tb.bind("<B1-Motion>", lambda e: root.geometry(
+        f"+{root.winfo_x() + e.x - drag['x']}+{root.winfo_y() + e.y - drag['y']}"
+    ))
+
     # Body
     body = tk.Frame(root, bg=Theme.BG)
     body.pack(fill="both", expand=True, padx=20, pady=12)
