@@ -15,6 +15,13 @@ echo Version: %PY_MAJOR%.%PY_MINOR%
 echo Python dir: %PYTHON_DIR%
 echo.
 
+:: ── Extract VERSION from main.py ─────────────────────────────────────────────
+for /f "tokens=3 delims= " %%v in ('findstr /R "^VERSION " main.py') do set APP_VERSION=%%v
+:: Strip surrounding quotes
+set APP_VERSION=%APP_VERSION:"=%
+echo App version: %APP_VERSION%
+echo.
+
 :: ── PyInstaller ──────────────────────────────────────────────────────────────
 python -m PyInstaller --version >nul 2>&1
 if errorlevel 1 (
@@ -56,15 +63,24 @@ if errorlevel 1 (
     pause & exit /b 1
 )
 
+:: ── Rename artifact to versioned name ────────────────────────────────────────
+set VERSIONED=dist\SlicerBridge_v%APP_VERSION%.exe
+if exist "dist\SlicerBridge.exe" (
+    rename "dist\SlicerBridge.exe" "SlicerBridge_v%APP_VERSION%.exe"
+    echo Renamed to: %VERSIONED%
+)
+
 :: ── Result ───────────────────────────────────────────────────────────────────
 echo.
-if exist "%~dp0dist\SlicerBridge.exe" (
+if exist "%~dp0%VERSIONED%" (
     echo === BUILD SUCCESSFUL ===
-    echo Output: %~dp0dist\SlicerBridge.exe
+    echo Output: %~dp0%VERSIONED%
     echo.
     echo Next steps:
-    echo   Run dist\SlicerBridge.exe
-    echo   Pick your slicer, click Install, approve UAC
+    echo   1. Run %VERSIONED%
+    echo   2. Pick your slicer, click Install, approve UAC
+    echo   3. Tag release on GitHub as v%APP_VERSION%
+    echo   4. Upload %VERSIONED% as release asset
 ) else (
     echo === BUILD FAILED - exe not found ===
 )

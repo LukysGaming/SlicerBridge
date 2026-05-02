@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
 import traceback
 import urllib.error
 import urllib.parse
@@ -53,12 +54,15 @@ _hide_console()
 # CONSTANTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-VERSION         = "1.1"
+VERSION         = "2.0.1"
+SCHEMA_VERSION  = 1          # bump when config structure changes (triggers migration)
 APP_NAME        = "SlicerBridge"
 EXE_NAME        = "SlicerBridge.exe"
 INSTALL_DIR_DEF = r"C:\Program Files (x86)\SlicerBridge"
 TEMP_PREFIX     = "slicerbridge_"
 TEMP_MAX_AGE_S  = 86_400  # clean up temp files older than 24 h
+GITHUB_REPO     = "LukysGaming/SlicerBridge"
+GITHUB_API_URL  = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
 CONFIG_DIR  = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME)
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
@@ -201,6 +205,229 @@ def save_config(data: dict) -> None:
     os.makedirs(CONFIG_DIR, exist_ok=True)
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MIGRATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _run_migrations(cfg: dict) -> dict:
+    """
+    Runs any pending config migrations in order.
+    Each migration_v{N}_to_v{N+1} receives the config dict and returns updated dict.
+    Registry is re-written after any migration so new protocols are registered.
+    """
+    current = cfg.get("schema_version", 0)
+
+    # ── Define migrations here as the app evolves ─────────────────────────────
+    # Example:
+    # def _migrate_v1_to_v2(c: dict) -> dict:
+    #     c.setdefault("some_new_key", "default_value")
+    #     return c
+    # migrations = {1: _migrate_v1_to_v2}
+    migrations: dict = {}
+
+    changed = False
+    while current < SCHEMA_VERSION:
+        fn = migrations.get(current)
+        if fn:
+            log(f"Migration: schema v{current} → v{current + 1}")
+            cfg = fn(cfg)
+        current += 1
+        changed = True
+
+    if changed:
+        cfg["schema_version"] = SCHEMA_VERSION
+        save_config(cfg)
+        log(f"Migration complete — schema now at v{SCHEMA_VERSION}")
+        # Re-register protocols silently so any new ones take effect
+        installed = cfg.get("installed_exe", "")
+        if installed and os.path.isfile(installed):
+            try:
+                write_registry(installed)
+                log("Registry refreshed after migration.")
+            except Exception as e:
+                log(f"Registry refresh after migration failed: {e}")
+
+    return cfg
+
+
+def run_migrations_if_needed() -> None:
+    """Called on startup — checks schema version and migrates if behind."""
+    cfg = load_config()
+    if cfg.get("schema_version", 0) < SCHEMA_VERSION:
+        _run_migrations(cfg)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AUTO-UPDATE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _parse_version(v: str) -> tuple[int, ...]:
+    """Parses '2.0.1' or 'v2.0.1' into (2, 0, 1)."""
+    v = v.lstrip("v").strip()
+    try:
+        return tuple(int(x) for x in v.split("."))
+    except ValueError:
+        return (0,)
+
+
+def _fetch_latest_release() -> tuple[str, str] | None:
+    """
+    Calls GitHub API and returns (tag, download_url) of the latest release exe,
+    or None on any error.
+    """
+    try:
+        req = urllib.request.Request(
+            GITHUB_API_URL,
+            headers={"User-Agent": f"SlicerBridge/{VERSION}"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+
+        tag = data.get("tag_name", "")
+        assets = data.get("assets", [])
+        exe_asset = next(
+            (a for a in assets if a.get("name", "").endswith(".exe")),
+            None,
+        )
+        if not tag or not exe_asset:
+            return None
+        return tag, exe_asset["browser_download_url"]
+    except Exception as e:
+        log(f"Update check failed: {e}")
+        return None
+
+
+def _do_update(new_version: str, download_url: str) -> None:
+    """Downloads new exe, writes a helper bat, restarts."""
+    import tkinter as tk
+    from tkinter import messagebox
+
+    log(f"Update: downloading v{new_version} from {download_url}")
+
+    # Download to temp
+    tmp_dir = tempfile.mkdtemp(prefix=TEMP_PREFIX)
+    new_exe = os.path.join(tmp_dir, EXE_NAME)
+
+    try:
+        req = urllib.request.Request(
+            download_url,
+            headers={"User-Agent": f"SlicerBridge/{VERSION}"},
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp, open(new_exe, "wb") as f:
+            shutil.copyfileobj(resp, f)
+    except Exception as e:
+        log(f"Update download failed: {e}")
+        r = tk.Tk(); r.withdraw()
+        messagebox.showerror("SlicerBridge — Update failed", f"Could not download update:\n{e}")
+        r.destroy()
+        return
+
+    current_exe = os.path.abspath(sys.executable)
+    current_pid = os.getpid()
+
+    # Write a helper bat that:
+    #   1. waits for old process to exit
+    #   2. copies new exe over old exe
+    #   3. starts new exe
+    #   4. deletes itself
+    bat_path = os.path.join(tmp_dir, "sb_updater.bat")
+    bat = (
+        "@echo off\n"
+        f":wait\n"
+        f"tasklist /FI \"PID eq {current_pid}\" 2>nul | find \"{current_pid}\" >nul\n"
+        f"if not errorlevel 1 (timeout /t 1 /nobreak >nul & goto wait)\n"
+        f"copy /y \"{new_exe}\" \"{current_exe}\" >nul\n"
+        f"start \"\" \"{current_exe}\"\n"
+        f"del \"%~f0\"\n"
+    )
+    with open(bat_path, "w") as f:
+        f.write(bat)
+
+    log(f"Update: launching helper bat, exiting current process.")
+    subprocess.Popen(
+        ["cmd.exe", "/c", bat_path],
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    sys.exit(0)
+
+
+def _show_update_prompt(new_version: str, download_url: str) -> None:
+    """Small standalone tkinter window asking user if they want to update."""
+    import tkinter as tk
+
+    root = tk.Tk()
+    root.overrideredirect(True)
+    root.configure(bg=Theme.BG)
+    root.attributes("-topmost", True)
+
+    # Center on screen
+    root.update_idletasks()
+    w, h = 420, 160
+    sw = root.winfo_screenwidth()
+    sh = root.winfo_screenheight()
+    root.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+
+    # Titlebar
+    tb = tk.Frame(root, bg=Theme.BORDER, height=28)
+    tb.pack(fill="x")
+    tb.pack_propagate(False)
+    tk.Label(tb, text="⬡  SlicerBridge — Update available",
+             bg=Theme.BORDER, fg=Theme.FG, font=("Segoe UI", 9, "bold")).pack(side="left", padx=10, pady=4)
+    tk.Label(tb, text="✕", bg=Theme.BORDER, fg=Theme.GRAY,
+             font=("Segoe UI", 11), cursor="hand2", padx=10).pack(side="right")\
+        .bind("<Button-1>", lambda e: root.destroy())
+
+    # Body
+    body = tk.Frame(root, bg=Theme.BG)
+    body.pack(fill="both", expand=True, padx=20, pady=12)
+
+    tk.Label(body,
+             text=f"Version {new_version} is available  (current: {VERSION})\nDo you want to update now?",
+             bg=Theme.BG, fg=Theme.FG, font=("Segoe UI", 10),
+             justify="left").pack(anchor="w")
+
+    btn_row = tk.Frame(body, bg=Theme.BG)
+    btn_row.pack(anchor="e", pady=(12, 0))
+
+    def on_yes():
+        root.destroy()
+        _do_update(new_version, download_url)
+
+    tk.Button(btn_row, text="  Yes, update  ",
+              bg=Theme.ACCENT, fg=Theme.BG, relief="flat",
+              font=("Segoe UI", 9, "bold"), cursor="hand2",
+              activebackground=Theme.FG, activeforeground=Theme.BG,
+              command=on_yes, padx=10, pady=4).pack(side="left", padx=(0, 8))
+
+    tk.Button(btn_row, text="Not now",
+              bg=Theme.BORDER, fg=Theme.GRAY, relief="flat",
+              font=("Segoe UI", 9), cursor="hand2",
+              activebackground=Theme.PANEL, activeforeground=Theme.FG,
+              command=root.destroy, padx=10, pady=4).pack(side="left")
+
+    root.mainloop()
+
+
+def start_update_check() -> None:
+    """
+    Spawns a background thread that checks for updates.
+    If a newer version is found, shows the update prompt on the main thread
+    via root.after (if GUI is open) or directly (if running as protocol handler).
+    """
+    def _check():
+        result = _fetch_latest_release()
+        if result is None:
+            return
+        tag, url = result
+        if _parse_version(tag) > _parse_version(VERSION):
+            log(f"Update available: {tag}")
+            # Show prompt — safe to call from thread since it creates its own root
+            _show_update_prompt(tag.lstrip("v"), url)
+
+    t = threading.Thread(target=_check, daemon=True, name="sb-update-check")
+    t.start()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -895,6 +1122,7 @@ def show_gui(error: str = "") -> None:
             handler_exe = sys.executable
 
         save_config({
+            "schema_version":  SCHEMA_VERSION,
             "slicer_path":   chosen,
             "installed_exe": handler_exe,
             "handler_exe":   handler_exe,
@@ -1037,6 +1265,11 @@ def _cmd_reset() -> None:
 
 def main() -> None:
     args = sys.argv[1:]
+
+    # Always run on startup — migrations are no-ops when schema is current
+    run_migrations_if_needed()
+    # Background update check — never blocks, shows prompt if newer version found
+    start_update_check()
 
     if not args:
         show_gui()
