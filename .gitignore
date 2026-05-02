@@ -3,3 +3,4 @@ dist/
 __pycache__/
 SlicerBridge.spec
 claude.md
+test.py
