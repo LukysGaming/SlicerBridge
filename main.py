@@ -1053,14 +1053,9 @@ def main() -> None:
     elif any(cmd.startswith(p + "://") for p in PROTOCOLS):
         handle_protocol(cmd)
     else:
-<<<<<<< HEAD
-        # GUI configurator / installer
-        show_gui()
-=======
         log(f"Unknown argument: {cmd!r} — falling back to GUI")
         show_gui()
 
 
 if __name__ == "__main__":
     main()
->>>>>>> 50f977c (Fix stuff, add tampermonkey script, add a tool to open from printables)

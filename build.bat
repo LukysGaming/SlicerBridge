@@ -36,19 +36,17 @@ if exist SlicerBridge.spec del SlicerBridge.spec
 echo Building...
 if exist icon.ico (
     python -m PyInstaller ^
-        --onedir ^
+        --onefile ^
         --noconsole ^
         --icon=icon.ico ^
         --name SlicerBridge ^
-        --collect-binaries python%PY_MAJOR%%PY_MINOR% ^
         main.py
 ) else (
     echo WARNING: icon.ico not found, building without icon.
     python -m PyInstaller ^
-        --onedir ^
+        --onefile ^
         --noconsole ^
         --name SlicerBridge ^
-        --collect-binaries python%PY_MAJOR%%PY_MINOR% ^
         main.py
 )
 
@@ -58,53 +56,14 @@ if errorlevel 1 (
     pause & exit /b 1
 )
 
-:: ── Copy Python DLL manually (fixes "Failed to load python3xx.dll") ──────────
-echo.
-echo Checking Python DLL...
-set DLL_NAME=python%PY_MAJOR%%PY_MINOR%.dll
-set DLL_SRC=%PYTHON_DIR%\%DLL_NAME%
-set DLL_DEST=dist\SlicerBridge\_internal\%DLL_NAME%
-
-if exist "%DLL_SRC%" (
-    if not exist "%DLL_DEST%" (
-        echo Copying %DLL_NAME% to _internal...
-        copy /y "%DLL_SRC%" "%DLL_DEST%" >nul
-        if errorlevel 1 (
-            echo WARNING: Failed to copy DLL. Trying dist root...
-            copy /y "%DLL_SRC%" "dist\SlicerBridge\%DLL_NAME%" >nul
-        ) else (
-            echo OK: DLL copied to _internal.
-        )
-    ) else (
-        echo OK: DLL already present.
-    )
-) else (
-    echo WARNING: %DLL_NAME% not found in %PYTHON_DIR%
-    echo Searching in PATH...
-    for /f "delims=" %%f in ('where %DLL_NAME% 2^>nul') do (
-        echo Found: %%f
-        copy /y "%%f" "%DLL_DEST%" >nul
-        goto :dll_done
-    )
-    echo WARNING: Could not find %DLL_NAME% — the exe may fail to start.
-)
-:dll_done
-
-:: ── Also copy from _internal to root as fallback ─────────────────────────────
-if exist "%DLL_DEST%" (
-    if not exist "dist\SlicerBridge\%DLL_NAME%" (
-        copy /y "%DLL_DEST%" "dist\SlicerBridge\%DLL_NAME%" >nul
-    )
-)
-
 :: ── Result ───────────────────────────────────────────────────────────────────
 echo.
-if exist "%~dp0dist\SlicerBridge\SlicerBridge.exe" (
+if exist "%~dp0dist\SlicerBridge.exe" (
     echo === BUILD SUCCESSFUL ===
-    echo Output: %~dp0dist\SlicerBridge\SlicerBridge.exe
+    echo Output: %~dp0dist\SlicerBridge.exe
     echo.
     echo Next steps:
-    echo   Run dist\SlicerBridge\SlicerBridge.exe
+    echo   Run dist\SlicerBridge.exe
     echo   Pick your slicer, click Install, approve UAC
 ) else (
     echo === BUILD FAILED - exe not found ===
