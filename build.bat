@@ -45,6 +45,7 @@ if exist icon.ico (
     python -m PyInstaller ^
         --onefile ^
         --noconsole ^
+        --noupx ^
         --icon=icon.ico ^
         --name SlicerBridge ^
         main.py

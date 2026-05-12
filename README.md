@@ -6,6 +6,21 @@ Download a model from MakerWorld, Printables, Thingiverse — or anywhere else �
 
 ---
 
+## Table of Contents
+- [How it works](#how-it-works)
+- [Supported protocols](#supported-protocols)
+- [Supported target slicers](#supported-target-slicers)
+- [Installation](#installation)
+  - [Option A — Download release (recommended)](#option-a---download-release-recommended)
+  - [Option B — Build from source](#option-b---build-from-source)
+- [Configuration](#configuration)
+- [Tampermonkey (Printables Companion)](#tampermonkey-printables-companion)
+  - [Planned](#planned)
+- [⚠️ Windows Defender False Positive](#windows-defender-false-positive)
+  - [Why does this happen?](#why-does-this-happen)
+  - [How to fix it](#how-to-fix-it)
+- [License](#license)
+
 ## How it works
 
 Sites like MakerWorld and Printables use custom URL protocols (`bambustudio://`, `prusa3d://`, `cura://`, etc.) to open models in specific slicers. SlicerBridge hijacks all of those protocols in the Windows registry and routes every model to **your** slicer instead.
@@ -109,6 +124,40 @@ To get the most out of SlicerBridge on Printables, install the companion Tamperm
 
 ### Planned
 * 3d model sites support (renaming the native "Open in XXX" buttons to your actual slicer).
+
+## ⚠️ Windows Defender False Positive
+
+Windows Defender (and some other antivirus tools) may flag SlicerBridge as
+`Trojan:Win32/Bearfoos.A!ml` and quarantine the executable. **This is a false positive.**
+
+### Why does this happen?
+
+SlicerBridge is built with [PyInstaller](https://pyinstaller.org/), which bundles
+a Python runtime and your script into a single `.exe`. This packaging technique is
+commonly used by legitimate tools — but it's also used by malware, so Windows Defender's
+**machine-learning heuristic** (`!ml` suffix = ML-based detection, not a known signature)
+flags it as suspicious.
+
+Additional factors that contribute to the false positive:
+- The `.exe` isnt signed
+- It writes to the Windows Registry (`winreg`) to register a URL protocol handler
+- It requests UAC elevation on first run
+- It stores config in `%APPDATA%`
+
+All of these are **required for SlicerBridge to function**, and the full source code is
+available in this repository for anyone to audit.
+
+### How to fix it
+
+**Option A — Run the exclusion script (recommended):**
+Download and run [`add_exclusion.ps1`](./add_exclusion.ps1) as Administrator.
+It adds a Windows Defender exclusion for the SlicerBridge executable.
+
+**Option B — Restore & exclude manually:**
+1. Open **Windows Security → Virus & threat protection → Protection history**
+2. Find the SlicerBridge entry and click **Restore**
+3. Go to **Virus & threat protection settings → Exclusions → Add an exclusion**
+4. Add the path to `SlicerBridge.exe`
 
 ## License
 
