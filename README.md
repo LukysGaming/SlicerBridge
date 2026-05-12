@@ -149,9 +149,8 @@ available in this repository for anyone to audit.
 
 ### How to fix it
 
-**Option A — Run the exclusion script (recommended):**
-Download and run [`add_exclusion.ps1`](./add_exclusion.ps1) as Administrator.
-It adds a Windows Defender exclusion for the SlicerBridge executable.
+**Option A — Run the exclusion script:**
+-soon-
 
 **Option B — Restore & exclude manually:**
 1. Open **Windows Security → Virus & threat protection → Protection history**
